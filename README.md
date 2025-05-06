@@ -1,18 +1,26 @@
 # 시니어 이상행동 영상 전처리
 
+## 환경 설정
+
+### 요구 사항
+
+- Python (3.8 ~ 3.10)
+- Anaconda3 (권장, Miniconda 사용 가능)
+- CUDA 환경 (골격 데이터 추출 가속)
+
 ## 단계
 
 ### 1. 클립 추출
 
-원본 비디오에서 타임스탬프 기반으로 클립 추출
+원본 비디오에서 타임스탬프 기반으로 행동 클립을 추출한다. 
 
 ### 2. 골격 데이터 추출
 
-MMPose의 HRNet 기반으로 Top down Pose Estimation을 수행하여 COCO 형식 17 키포인트 추출
+MMPose의 HRNet 기반으로 Top down Pose Estimation을 수행하여 COCO-Keypoint 형식 17 키포인트를 추출한다. 결과물은 각 클립에 대한 `.pkl` 파일이다.
 
 ### 3. 최종 데이터 생성
 
-
+각 클립 `.pkl`을 스플릿(train or val) 단위로 묶어 최종 데이터셋을 생성한다.
 
 ## 참고: 데이터 포맷
 
@@ -94,7 +102,7 @@ MMPose의 HRNet 기반으로 Top down Pose Estimation을 수행하여 COCO 형�
 }
 ```
 
-- `split`: Dictionary, 키는 스플릿 이름, 값은 클립 고유 이름
+- `split`: Dictionary, 키는 스플릿 이름, 값은 해당하는 스플릿에 대한 클립 고유 이름을 모은 리스트
 - `annotations`: List of Dictionary, 각 딕셔너리는 클립별 행동 정보를 포함
   - `frame_dir`: 클립의 고유 이름
   - `label`: 정수형 클래스
