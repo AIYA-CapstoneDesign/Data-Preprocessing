@@ -2,9 +2,9 @@ import argparse
 import os
 import time
 from collections import deque
+import traceback
 
 import cv2
-import numpy as np
 
 from models import YOLOv11Pose, FasterRCNN, HRNet, YOLOv8
 from trackers import ByteTrackTracker
@@ -58,6 +58,18 @@ parser.add_argument(
     default=5,
     help="키포인트 스무딩 윈도우 크기 (프레임 수)",
 )
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=1,
+    help="배치 처리 크기 (1이면 비활성화, YOLOv11-Pose만 지원)",
+)
+parser.add_argument(
+    "--buffer-size",
+    type=int,
+    default=4,
+    help="프레임 버퍼 크기 (배치 처리 시 사용)",
+)
 args = parser.parse_args()
 
 
@@ -83,8 +95,8 @@ try:
             onnx_path="models/onnx/yolo11m-pose.onnx",
             cuda=True,
             person_class_id=0,
-            score_threshold=args.det_score_thresh,
-            iou_threshold=0.45,
+            score_threshold=None,
+            batch_size=args.batch_size,
         )
 
     # Top-Down 모드에서만 검출기와 추적기 초기화
@@ -273,217 +285,440 @@ def visualize_inference(video_path: str, output_path: str = None):
 
     # 키포인트의 이전 위치를 저장하는 버퍼
     keypoints_buffers = {}  # track_id를 키로 사용하는 딕셔너리
+    
+    # 배치 처리용 프레임 버퍼
+    frame_buffer = []
+    frame_positions = []  # 프레임 위치 저장
+    
+    # 배치 처리 사용 여부
+    use_batch = args.batch_size > 1 and args.det_model == "yolov11-pose"
+    if use_batch:
+        print(f"배치 추론 활성화: 배치 크기 = {args.batch_size}, 버퍼 크기 = {args.buffer_size}")
 
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_count += 1
-        orig_h, orig_w = frame.shape[:2]
-
         # 프레임 처리 시작 시간
         frame_start_time = time.time()
+        
+        # 배치 처리를 위한 프레임 버퍼 채우기
+        if use_batch:
+            # 다음 배치만큼 프레임 읽기
+            while len(frame_buffer) < args.buffer_size:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                frame_buffer.append(frame)
+                frame_positions.append(frame_count)
+            
+            # 버퍼가 비었으면 종료
+            if not frame_buffer:
+                break
+            
+            # 배치 추론 수행
+            try:
+                batch_results = yolov11_pose.process_batch(frame_buffer)
+                
+                # 결과 처리
+                for i, (frame, position, results) in enumerate(zip(frame_buffer, frame_positions, batch_results)):
+                    orig_h, orig_w = frame.shape[:2]
+                    
+                    # 결과 시각화
+                    keypoints_list = results["keypoints"]
+                    scores_list = results["scores"]
+                    bboxes = results["bboxes"]
+                    
+                    # 결과 필터링 (너무 작은 박스, 종횡비 등)
+                    filtered_results = {"keypoints": [], "scores": [], "bboxes": []}
 
-        try:
-            # YOLOv11-Pose 모델 사용
-            if args.det_model == "yolov11-pose" and yolov11_pose is not None:
-                # YOLOv11-Pose로 직접 추론
-                results = yolov11_pose(frame)
-            # Top-Down 모드
-            elif args.pose_mode == "top-down" and detector is not None:
-                # 객체 검출 (Faster R-CNN 또는 YOLOv8)
-                detections = detector(frame)
+                    for j, (keypoints, scores, bbox) in enumerate(
+                        zip(keypoints_list, scores_list, bboxes)
+                    ):
+                        try:
+                            # 신뢰도 너무 낮은 것은 제외
+                            if bbox.score < args.det_score_thresh:
+                                continue
 
-                # 추적기가 있으면 추적 수행
-                if tracker is not None:
-                    detections = tracker(detections)
+                            # 박스 크기가 너무 작은 것은 제외 (픽셀 기준)
+                            box_w = max(0, bbox.x2 - bbox.x1)
+                            box_h = max(0, bbox.y2 - bbox.y1)
+                            if box_w * box_h < args.min_box_area:  # 최소 박스 면적
+                                continue
 
-                # 포즈 추정 (HRNet with detections)
-                results = hrnet(frame, detections)
-            # Bottom-Up 모드
-            else:
-                # 포즈 추정 (HRNet without detections)
-                results = hrnet(frame)
+                            # 종횡비가 비정상적인 것 제외
+                            aspect_ratio = box_w / box_h if box_h > 0 else 0
+                            if aspect_ratio < 0.2:
+                                continue
 
-            keypoints_list = results["keypoints"]
-            scores_list = results["scores"]
-            bboxes = results["bboxes"]
+                            filtered_results["keypoints"].append(keypoints)
+                            filtered_results["scores"].append(scores)
+                            filtered_results["bboxes"].append(bbox)
+                        except Exception as e:
+                            print(f"바운딩 박스 필터링 오류: {e}")
+                            continue
 
-            # 결과 필터링 (너무 작은 박스, 종횡비 등)
-            filtered_results = {"keypoints": [], "scores": [], "bboxes": []}
+                    # 필터링된 결과로 업데이트
+                    keypoints_list = filtered_results["keypoints"]
+                    scores_list = filtered_results["scores"]
+                    bboxes = filtered_results["bboxes"]
+                    
+                    # 결과 시각화
+                    for j, (keypoints, scores, bbox) in enumerate(
+                        zip(keypoints_list, scores_list, bboxes)
+                    ):
+                        try:
+                            # 바운딩 박스 그리기
+                            x1 = max(0, int(bbox.x1))
+                            y1 = max(0, int(bbox.y1))
+                            x2 = min(orig_w - 1, int(bbox.x2))
+                            y2 = min(orig_h - 1, int(bbox.y2))
 
-            for i, (keypoints, scores, bbox) in enumerate(
-                zip(keypoints_list, scores_list, bboxes)
-            ):
-                try:
-                    # 신뢰도 너무 낮은 것은 제외
-                    if bbox.score < args.det_score_thresh:
-                        continue
+                            # 유효한 박스 확인
+                            if x2 <= x1 or y2 <= y1:
+                                continue
 
-                    # 박스 크기가 너무 작은 것은 제외 (픽셀 기준)
-                    box_w = max(0, bbox.x2 - bbox.x1)
-                    box_h = max(0, bbox.y2 - bbox.y1)
-                    if box_w * box_h < args.min_box_area:  # 최소 박스 면적
-                        continue
+                            # 박스 색상: 신뢰도에 따라 색상 변경 (높을수록 빨간색에 가까움)
+                            color_scale = min(1.0, bbox.score)
+                            color = (0, int(255 * (1 - color_scale)), int(255 * color_scale))
 
-                    # 종횡비가 비정상적인 것 제외
-                    aspect_ratio = box_w / box_h if box_h > 0 else 0
-                    if aspect_ratio < 0.2:
-                        continue
+                            # 바운딩 박스 그리기
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                    filtered_results["keypoints"].append(keypoints)
-                    filtered_results["scores"].append(scores)
-                    filtered_results["bboxes"].append(bbox)
-                except Exception as e:
-                    print(f"바운딩 박스 필터링 오류: {e}")
-                    continue
+                            # 트랙 ID와 신뢰도 텍스트 표시
+                            text = (
+                                f"ID:{bbox.track_id} {bbox.score:.2f}"
+                                if bbox.track_id is not None
+                                else f"{bbox.score:.2f}"
+                            )
+                            cv2.putText(
+                                frame,
+                                text,
+                                (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                color,
+                                2,
+                            )
 
-            # 필터링된 결과로 업데이트
-            keypoints_list = filtered_results["keypoints"]
-            scores_list = filtered_results["scores"]
-            bboxes = filtered_results["bboxes"]
+                            if args.smooth_keypoints and bbox.track_id is not None:
+                                # 각 객체별로 버퍼 관리
+                                track_id = bbox.track_id
+                                if track_id not in keypoints_buffers:
+                                    keypoints_buffers[track_id] = deque(
+                                        maxlen=args.smooth_window
+                                    )
 
-            # 결과 시각화
-            for i, (keypoints, scores, bbox) in enumerate(
-                zip(keypoints_list, scores_list, bboxes)
-            ):
-                try:
-                    # 바운딩 박스 그리기
-                    x1 = max(0, int(bbox.x1))
-                    y1 = max(0, int(bbox.y1))
-                    x2 = min(orig_w - 1, int(bbox.x2))
-                    y2 = min(orig_h - 1, int(bbox.y2))
+                                # 키포인트 스무딩 적용
+                                smoothed_keypoints = keypoints.copy()
+                                buffer = keypoints_buffers[track_id]
 
-                    # 유효한 박스 확인
-                    if x2 <= x1 or y2 <= y1:
-                        continue
+                                if buffer:  # 버퍼에 이전 프레임 데이터가 있으면
+                                    for k in range(len(keypoints)):
+                                        if scores[k] < 0.3:  # 낮은 신뢰도는 필터링 안함
+                                            continue
 
-                    # 박스 색상: 신뢰도에 따라 색상 변경 (높을수록 빨간색에 가까움)
-                    color_scale = min(1.0, bbox.score)
-                    color = (0, int(255 * (1 - color_scale)), int(255 * color_scale))
+                                        weight_sum = scores[k]
+                                        weighted_pos = keypoints[k] * scores[k]
 
-                    # 바운딩 박스 그리기
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                                        # 이전 프레임 키포인트 가중 평균
+                                        for prev_keypoints, prev_scores in buffer:
+                                            if prev_scores[k] > 0.2:
+                                                weight = prev_scores[k]
+                                                weighted_pos += prev_keypoints[k] * weight
+                                                weight_sum += weight
 
-                    # 트랙 ID와 신뢰도 텍스트 표시
-                    text = (
-                        f"ID:{bbox.track_id} {bbox.score:.2f}"
-                        if bbox.track_id is not None
-                        else f"{bbox.score:.2f}"
-                    )
+                                        if weight_sum > 0:
+                                            smoothed_keypoints[k] = weighted_pos / weight_sum
+
+                                # 현재 키포인트 저장
+                                buffer.append((keypoints.copy(), scores.copy()))
+
+                                # 스무딩된 키포인트 그리기
+                                draw_keypoints(
+                                    frame, smoothed_keypoints, scores, args.keypoint_thresh
+                                )
+                            else:
+                                # 스무딩 없이 키포인트 그리기
+                                draw_keypoints(frame, keypoints, scores, args.keypoint_thresh)
+
+                        except Exception as e:
+                            print(f"사람 처리 오류: {e}")
+                            continue
+                    
+                    # 현재 프레임 정보 표시
                     cv2.putText(
                         frame,
-                        text,
-                        (x1, y1 - 5),
+                        f"Frame: {position}/{total_frames} | FPS: {processing_fps:.1f}",
+                        (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
+                        1.0,
+                        (0, 255, 0),
                         2,
                     )
 
-                    if args.smooth_keypoints and bbox.track_id is not None:
-                        # 각 객체별로 버퍼 관리
-                        track_id = bbox.track_id
-                        if track_id not in keypoints_buffers:
-                            keypoints_buffers[track_id] = deque(
-                                maxlen=args.smooth_window
-                            )
-
-                        # 키포인트 스무딩 적용
-                        smoothed_keypoints = keypoints.copy()
-                        buffer = keypoints_buffers[track_id]
-
-                        if buffer:  # 버퍼에 이전 프레임 데이터가 있으면
-                            for j in range(len(keypoints)):
-                                if scores[j] < 0.3:  # 낮은 신뢰도는 필터링 안함
-                                    continue
-
-                                weight_sum = scores[j]
-                                weighted_pos = keypoints[j] * scores[j]
-
-                                # 이전 프레임 키포인트 가중 평균
-                                for prev_keypoints, prev_scores in buffer:
-                                    if prev_scores[j] > 0.2:
-                                        weight = prev_scores[j]
-                                        weighted_pos += prev_keypoints[j] * weight
-                                        weight_sum += weight
-
-                                if weight_sum > 0:
-                                    smoothed_keypoints[j] = weighted_pos / weight_sum
-
-                        # 현재 키포인트 저장
-                        buffer.append((keypoints.copy(), scores.copy()))
-
-                        # 스무딩된 키포인트 그리기
-                        draw_keypoints(
-                            frame, smoothed_keypoints, scores, args.keypoint_thresh
-                        )
+                    # 경과 시간 표시
+                    elapsed_time = time.time() - start_time
+                    smooth_text = "Smooth ON" if args.smooth_keypoints else "Smooth OFF"
+                    batch_text = f"Batch {args.batch_size}" if use_batch else "Single"
+                    cv2.putText(
+                        frame,
+                        f"Time: {elapsed_time:.1f}s | Mode: {args.pose_mode} | {smooth_text} | {batch_text}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0,
+                        (0, 255, 0),
+                        2,
+                    )
+                    
+                    # 화면 또는 비디오에 출력
+                    if video_writer:
+                        video_writer.write(frame)
                     else:
-                        # 스무딩 없이 키포인트 그리기
-                        draw_keypoints(frame, keypoints, scores, args.keypoint_thresh)
+                        # 디스플레이용 프레임 크기 조정
+                        if orig_w > DISPLAY_MAX_W:
+                            scale = DISPLAY_MAX_W / orig_w
+                            new_size = (int(orig_w * scale), int(orig_h * scale))
+                            frame_disp = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+                        else:
+                            frame_disp = frame
 
-                except Exception as e:
-                    print(f"사람 처리 오류: {e}")
-                    continue
+                        cv2.imshow(f"Pose Estimation ({args.pose_mode})", frame_disp)
 
-            # 처리 FPS 계산
-            frame_time = time.time() - frame_start_time
-            processing_fps = 1.0 / frame_time if frame_time > 0 else 0
-
-        except Exception as e:
-            print(f"프레임 {frame_count} 처리 오류: {e}")
-
-        # 현재 프레임 정보 표시
-        cv2.putText(
-            frame,
-            f"Frame: {frame_count}/{total_frames} | FPS: {processing_fps:.1f}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
-        )
-
-        # 경과 시간 표시
-        elapsed_time = time.time() - start_time
-        smooth_text = "Smooth ON" if args.smooth_keypoints else "Smooth OFF"
-        cv2.putText(
-            frame,
-            f"Time: {elapsed_time:.1f}s | Mode: {args.pose_mode} | {smooth_text}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
-        )
-
-        # 화면 또는 비디오에 출력
-        if video_writer:
-            video_writer.write(frame)
-
-            # 진행 상황 표시
-            if frame_count % 10 == 0 or frame_count == total_frames:
-                progress = (frame_count / total_frames) * 100
-                print(
-                    f"\r진행 상황: {progress:.1f}% ({frame_count}/{total_frames}) | FPS: {processing_fps:.1f}",
-                    end="",
-                )
+                        # ESC 또는 q 키로 종료
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord("q") or key == 27:  # ESC
+                            break
+                
+                # 진행 상황 표시
+                if video_writer and (frame_count % 10 == 0 or frame_count >= total_frames):
+                    progress = (frame_count / total_frames) * 100
+                    print(
+                        f"\r진행 상황: {progress:.1f}% ({frame_count}/{total_frames}) | FPS: {processing_fps:.1f}",
+                        end="",
+                    )
+                
+                # 배치 처리 시간 계산
+                batch_time = time.time() - frame_start_time
+                processing_fps = len(frame_buffer) / batch_time if batch_time > 0 else 0
+                
+                # 처리된 프레임 버퍼 비우기
+                frame_buffer = []
+                frame_positions = []
+                
+            except Exception as e:
+                print(f"배치 처리 오류: {traceback.format_exc()}")
+                # 오류 발생 시 배치 처리를 중단하고 단일 프레임 처리로 전환
+                frame_buffer = []
+                frame_positions = []
+                use_batch = False
+                
         else:
-            # 디스플레이용 프레임 크기 조정
-            if orig_w > DISPLAY_MAX_W:
-                scale = DISPLAY_MAX_W / orig_w
-                new_size = (int(orig_w * scale), int(orig_h * scale))
-                frame_disp = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-            else:
-                frame_disp = frame
-
-            cv2.imshow(f"Pose Estimation ({args.pose_mode})", frame_disp)
-
-            # ESC 또는 q 키로 종료
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:  # ESC
+            # 단일 프레임 처리 (기존 코드)
+            ret, frame = cap.read()
+            if not ret:
                 break
+
+            frame_count += 1
+            orig_h, orig_w = frame.shape[:2]
+
+            try:
+                # YOLOv11-Pose 모델 사용
+                if args.det_model == "yolov11-pose" and yolov11_pose is not None:
+                    # YOLOv11-Pose로 직접 추론
+                    results = yolov11_pose(frame)
+                # Top-Down 모드
+                elif args.pose_mode == "top-down" and detector is not None:
+                    # 객체 검출 (Faster R-CNN 또는 YOLOv8)
+                    detections = detector(frame)
+
+                    # 추적기가 있으면 추적 수행
+                    if tracker is not None:
+                        detections = tracker(detections)
+
+                    # 포즈 추정 (HRNet with detections)
+                    results = hrnet(frame, detections)
+                # Bottom-Up 모드
+                else:
+                    # 포즈 추정 (HRNet without detections)
+                    results = hrnet(frame)
+
+                keypoints_list = results["keypoints"]
+                scores_list = results["scores"]
+                bboxes = results["bboxes"]
+
+                # 결과 필터링 (너무 작은 박스, 종횡비 등)
+                filtered_results = {"keypoints": [], "scores": [], "bboxes": []}
+
+                for i, (keypoints, scores, bbox) in enumerate(
+                    zip(keypoints_list, scores_list, bboxes)
+                ):
+                    try:
+                        # 신뢰도 너무 낮은 것은 제외
+                        if bbox.score < args.det_score_thresh:
+                            continue
+
+                        # 박스 크기가 너무 작은 것은 제외 (픽셀 기준)
+                        box_w = max(0, bbox.x2 - bbox.x1)
+                        box_h = max(0, bbox.y2 - bbox.y1)
+                        if box_w * box_h < args.min_box_area:  # 최소 박스 면적
+                            continue
+
+                        # 종횡비가 비정상적인 것 제외
+                        aspect_ratio = box_w / box_h if box_h > 0 else 0
+                        if aspect_ratio < 0.2:
+                            continue
+
+                        filtered_results["keypoints"].append(keypoints)
+                        filtered_results["scores"].append(scores)
+                        filtered_results["bboxes"].append(bbox)
+                    except Exception as e:
+                        print(f"바운딩 박스 필터링 오류: {e}")
+                        continue
+
+                # 필터링된 결과로 업데이트
+                keypoints_list = filtered_results["keypoints"]
+                scores_list = filtered_results["scores"]
+                bboxes = filtered_results["bboxes"]
+
+                # 결과 시각화
+                for i, (keypoints, scores, bbox) in enumerate(
+                    zip(keypoints_list, scores_list, bboxes)
+                ):
+                    try:
+                        # 바운딩 박스 그리기
+                        x1 = max(0, int(bbox.x1))
+                        y1 = max(0, int(bbox.y1))
+                        x2 = min(orig_w - 1, int(bbox.x2))
+                        y2 = min(orig_h - 1, int(bbox.y2))
+
+                        # 유효한 박스 확인
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        # 박스 색상: 신뢰도에 따라 색상 변경 (높을수록 빨간색에 가까움)
+                        color_scale = min(1.0, bbox.score)
+                        color = (0, int(255 * (1 - color_scale)), int(255 * color_scale))
+
+                        # 바운딩 박스 그리기
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                        # 트랙 ID와 신뢰도 텍스트 표시
+                        text = (
+                            f"ID:{bbox.track_id} {bbox.score:.2f}"
+                            if bbox.track_id is not None
+                            else f"{bbox.score:.2f}"
+                        )
+                        cv2.putText(
+                            frame,
+                            text,
+                            (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            2,
+                        )
+
+                        if args.smooth_keypoints and bbox.track_id is not None:
+                            # 각 객체별로 버퍼 관리
+                            track_id = bbox.track_id
+                            if track_id not in keypoints_buffers:
+                                keypoints_buffers[track_id] = deque(
+                                    maxlen=args.smooth_window
+                                )
+
+                            # 키포인트 스무딩 적용
+                            smoothed_keypoints = keypoints.copy()
+                            buffer = keypoints_buffers[track_id]
+
+                            if buffer:  # 버퍼에 이전 프레임 데이터가 있으면
+                                for j in range(len(keypoints)):
+                                    if scores[j] < 0.3:  # 낮은 신뢰도는 필터링 안함
+                                        continue
+
+                                    weight_sum = scores[j]
+                                    weighted_pos = keypoints[j] * scores[j]
+
+                                    # 이전 프레임 키포인트 가중 평균
+                                    for prev_keypoints, prev_scores in buffer:
+                                        if prev_scores[j] > 0.2:
+                                            weight = prev_scores[j]
+                                            weighted_pos += prev_keypoints[j] * weight
+                                            weight_sum += weight
+
+                                    if weight_sum > 0:
+                                        smoothed_keypoints[j] = weighted_pos / weight_sum
+
+                            # 현재 키포인트 저장
+                            buffer.append((keypoints.copy(), scores.copy()))
+
+                            # 스무딩된 키포인트 그리기
+                            draw_keypoints(
+                                frame, smoothed_keypoints, scores, args.keypoint_thresh
+                            )
+                        else:
+                            # 스무딩 없이 키포인트 그리기
+                            draw_keypoints(frame, keypoints, scores, args.keypoint_thresh)
+
+                    except Exception as e:
+                        print(f"사람 처리 오류: {e}")
+                        continue
+
+                # 처리 FPS 계산
+                frame_time = time.time() - frame_start_time
+                processing_fps = 1.0 / frame_time if frame_time > 0 else 0
+
+            except Exception as e:
+                print(f"프레임 {frame_count} 처리 오류: {traceback.format_exc()}")
+
+            # 현재 프레임 정보 표시
+            cv2.putText(
+                frame,
+                f"Frame: {frame_count}/{total_frames} | FPS: {processing_fps:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                2,
+            )
+
+            # 경과 시간 표시
+            elapsed_time = time.time() - start_time
+            smooth_text = "Smooth ON" if args.smooth_keypoints else "Smooth OFF"
+            cv2.putText(
+                frame,
+                f"Time: {elapsed_time:.1f}s | Mode: {args.pose_mode} | {smooth_text}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                2,
+            )
+
+            # 화면 또는 비디오에 출력
+            if video_writer:
+                video_writer.write(frame)
+
+                # 진행 상황 표시
+                if frame_count % 10 == 0 or frame_count == total_frames:
+                    progress = (frame_count / total_frames) * 100
+                    print(
+                        f"\r진행 상황: {progress:.1f}% ({frame_count}/{total_frames}) | FPS: {processing_fps:.1f}",
+                        end="",
+                    )
+            else:
+                # 디스플레이용 프레임 크기 조정
+                if orig_w > DISPLAY_MAX_W:
+                    scale = DISPLAY_MAX_W / orig_w
+                    new_size = (int(orig_w * scale), int(orig_h * scale))
+                    frame_disp = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+                else:
+                    frame_disp = frame
+
+                cv2.imshow(f"Pose Estimation ({args.pose_mode})", frame_disp)
+
+                # ESC 또는 q 키로 종료
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:  # ESC
+                    break
 
     # 자원 해제
     cap.release()

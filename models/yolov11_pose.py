@@ -20,6 +20,7 @@ class YOLOv11Pose:
         person_class_id: int = 0,
         score_threshold: Optional[float] = 0.5,
         iou_threshold: Optional[float] = 0.5,
+        batch_size: int = 1,
     ):
         self.onnx_path = onnx_path
         self.use_cuda = cuda
@@ -27,27 +28,23 @@ class YOLOv11Pose:
         self.score_threshold = score_threshold
         self.iou_threshold = iou_threshold
         self.num_keypoints = 17  # COCO 키포인트 수
+        self.batch_size = batch_size
         
         self.load_model()
 
     def __call__(self, image: np.ndarray) -> dict:
-        try:
-            original_H, original_W = image.shape[:2]
+        original_H, original_W = image.shape[:2]
 
-            image, top, left = self.preprocess(image)
-            resized_H, resized_W = image.shape[2], image.shape[3]
+        image, top, left = self.preprocess(image)
+        resized_H, resized_W = image.shape[2], image.shape[3]
 
-            outputs = self.predict(image)
+        outputs = self.predict(image)
 
-            results = self.postprocess(
-                outputs, original_H, original_W, resized_H, resized_W, top, left
-            )
+        results = self.postprocess(
+            outputs, original_H, original_W, resized_H, resized_W, top, left
+        )
 
-            return results
-        except Exception as e:
-            print(f"YOLOv11-Pose 처리 오류: {e}")
-            # 오류 발생 시 빈 결과 반환
-            return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+        return results
 
     def load_model(self):
         """
@@ -157,136 +154,214 @@ class YOLOv11Pose:
         Returns:
             dict: {"bboxes": List[BBox], "keypoints": np.ndarray, "scores": np.ndarray}
         """
-        try:
-            # 배치 차원 제거 및 형상 조정
-            # 출력이 (1, 56, 8400)이 아닐 경우 다른 방식으로 처리
-            if len(outputs.shape) == 3 and outputs.shape[1] == 56:
-                # 예측 결과 형상 조정 (1, 56, 8400) -> (8400, 56)
-                predictions = np.transpose(outputs, (0, 2, 1))[0]
+        # 배치 차원 제거 및 형상 조정
+        # 출력이 (1, 56, 8400)이 아닐 경우 다른 방식으로 처리
+        if len(outputs.shape) == 3 and outputs.shape[1] == 56:
+            # 예측 결과 형상 조정 (1, 56, 8400) -> (8400, 56)
+            predictions = np.transpose(outputs, (0, 2, 1))[0]
+        else:
+            # 다른 출력 형태일 경우 적절히 처리
+            if len(outputs.shape) == 2:  # (N, 56) 형태로 이미 변환된 경우
+                predictions = outputs
+            elif len(outputs.shape) > 3:  # 추가 차원이 있는 경우
+                predictions = outputs.reshape(-1, 56)
             else:
-                # 다른 출력 형태일 경우 적절히 처리
-                if len(outputs.shape) == 2:  # (N, 56) 형태로 이미 변환된 경우
-                    predictions = outputs
-                elif len(outputs.shape) > 3:  # 추가 차원이 있는 경우
-                    predictions = outputs.reshape(-1, 56)
-                else:
-                    # 기본 처리 시도
-                    predictions = np.transpose(outputs, (2, 1, 0)).reshape(-1, 56)
+                # 기본 처리 시도
+                predictions = np.transpose(outputs, (2, 1, 0)).reshape(-1, 56)
             
-            # 바운딩 박스, 객체성, 키포인트 분리
-            # 4(bbox) + 1(obj) + 17*3(kpt) = 56
-            box_predictions = predictions[:, :4]  # x, y, w, h (중심점 + 크기)
-            obj_predictions = predictions[:, 4]  # 객체성 점수
-            kpt_predictions = predictions[:, 5:].reshape(-1, 17, 3)  # 17개 키포인트 x, y, conf
-            
-            # 임계값 필터링
-            mask = obj_predictions > (self.score_threshold if self.score_threshold is not None else 0.25)
-            
-            if not np.any(mask):
-                return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
-            
-            # 필터링된 예측 결과
-            filtered_boxes = box_predictions[mask]
-            filtered_scores = obj_predictions[mask]
-            filtered_keypoints = kpt_predictions[mask]
-            
-            # 패딩 제외한 실제 이미지 크기 계산
-            unpadded_H = resized_H - 2 * pad_h
-            unpadded_W = resized_W - 2 * pad_w
-            
-            # 원본 이미지 스케일 계산
-            scale_x = original_W / unpadded_W
-            scale_y = original_H / unpadded_H
-            
-            # 바운딩 박스를 XYWH(중심점, 너비, 높이)에서 XYXY(좌상단, 우하단)로 변환
-            boxes = []
-            valid_indices = []  # 유효한 박스의 인덱스를 저장
-            
-            for i, box in enumerate(filtered_boxes):
-                x, y, w, h = box
-                
-                # 패딩 제거
-                x = x - pad_w
-                y = y - pad_h
-                
-                # 패딩을 제외한 실제 이미지 영역 내에서의 비율로 변환 후 원본 이미지 크기로 스케일링
-                left = max(0, int((x - w / 2) * scale_x))
-                top = max(0, int((y - h / 2) * scale_y))
-                right = min(original_W, int((x + w / 2) * scale_x))
-                bottom = min(original_H, int((y + h / 2) * scale_y))
-                
-                # 유효한 좌표인지 확인
-                if left >= original_W or top >= original_H or right <= 0 or bottom <= 0 or right <= left or bottom <= top:
-                    continue
-                    
-                boxes.append([left, top, right, bottom])
-                valid_indices.append(i)  # 유효한 박스의 인덱스 저장
-            
-            if not boxes:
-                return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
-            
-            # 유효한 박스에 대응하는 점수만 선택
-            valid_scores = filtered_scores[valid_indices]
-            valid_keypoints = filtered_keypoints[valid_indices]
-            
-            # NMS 적용
-            boxes_np = np.array(boxes)
-            scores_np = np.array(valid_scores)
-            
-            # 크기 일치 확인
-            if len(boxes_np) != len(scores_np):
-                print(f"경고: 바운딩 박스({len(boxes_np)})와 점수({len(scores_np)})의 크기가 일치하지 않습니다.")
-                return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
-            
-            indices = cv2.dnn.NMSBoxes(
-                boxes_np.tolist(),
-                scores_np.tolist(),
-                self.score_threshold if self.score_threshold is not None else 0.25,
-                self.iou_threshold if self.iou_threshold is not None else 0.45
-            )
-            
-            if len(indices) == 0:
-                return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
-                
-            if not isinstance(indices, list):
-                indices = indices.flatten()
-            
-            # 최종 결과 생성
-            bboxes = []
-            final_keypoints = []
-            final_kpt_scores = []
-            
-            for i in indices:
-                # 바운딩 박스 생성
-                left, top, right, bottom = boxes[i]
-                score = valid_scores[i]
-                bboxes.append(BBox(left, top, right, bottom, score, self.person_class_id))
-                
-                # 키포인트 변환
-                keypoints = valid_keypoints[i]
-                keypoints_xy = keypoints[:, :2].copy()
-                
-                # 패딩 제거
-                keypoints_xy[:, 0] -= pad_w
-                keypoints_xy[:, 1] -= pad_h
-                
-                # 원본 이미지 크기로 스케일링
-                keypoints_xy[:, 0] *= scale_x
-                keypoints_xy[:, 1] *= scale_y
-                
-                # 키포인트 점수
-                keypoints_conf = keypoints[:, 2]
-                
-                final_keypoints.append(keypoints_xy)
-                final_kpt_scores.append(keypoints_conf)
-            
-            return {
-                "bboxes": bboxes,
-                "keypoints": np.array(final_keypoints),
-                "scores": np.array(final_kpt_scores)
-            }
-        except Exception as e:
-            print(f"후처리 오류: {e}")
-            # 오류 발생 시 빈 결과 반환
+        # 바운딩 박스, 객체성, 키포인트 분리
+        # 4(bbox) + 1(obj) + 17*3(kpt) = 56
+        box_predictions = predictions[:, :4]  # x, y, w, h (중심점 + 크기)
+        obj_predictions = predictions[:, 4]  # 객체성 점수
+        kpt_predictions = predictions[:, 5:].reshape(-1, 17, 3)  # 17개 키포인트 x, y, conf
+        
+        if len(box_predictions) == 0:
             return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+        
+        # 패딩 제외한 실제 이미지 크기 계산
+        unpadded_H = resized_H - 2 * pad_h
+        unpadded_W = resized_W - 2 * pad_w
+        
+        # 원본 이미지 스케일 계산
+        scale_x = original_W / unpadded_W
+        scale_y = original_H / unpadded_H
+        
+        # 바운딩 박스를 XYWH(중심점, 너비, 높이)에서 XYXY(좌상단, 우하단)로 변환
+        boxes = []
+        valid_indices = []  # 유효한 박스의 인덱스를 저장
+        
+        for i, box in enumerate(box_predictions):
+            x, y, w, h = box
+            
+            # 패딩 제거
+            x = x - pad_w
+            y = y - pad_h
+            
+            # 패딩을 제외한 실제 이미지 영역 내에서의 비율로 변환 후 원본 이미지 크기로 스케일링
+            left = max(0, int((x - w / 2) * scale_x))
+            top = max(0, int((y - h / 2) * scale_y))
+            right = min(original_W, int((x + w / 2) * scale_x))
+            bottom = min(original_H, int((y + h / 2) * scale_y))
+            
+            # 유효한 좌표인지 확인
+            if left >= original_W or top >= original_H or right <= 0 or bottom <= 0 or right <= left or bottom <= top:
+                continue
+                
+            boxes.append([left, top, right, bottom])
+            valid_indices.append(i)  # 유효한 박스의 인덱스 저장
+        
+        if not boxes:
+            return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+        
+        # 유효한 박스에 대응하는 점수만 선택
+        valid_scores = obj_predictions[valid_indices]
+        valid_keypoints = kpt_predictions[valid_indices]
+        
+        # NMS 적용
+        boxes_np = np.array(boxes)
+        scores_np = np.array(valid_scores)
+        
+        # 크기 일치 확인
+        if len(boxes_np) != len(scores_np):
+            print(f"경고: 바운딩 박스({len(boxes_np)})와 점수({len(scores_np)})의 크기가 일치하지 않습니다.")
+            return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+        
+        indices = cv2.dnn.NMSBoxes(
+            boxes_np.tolist(),
+            scores_np.tolist(),
+            self.score_threshold if self.score_threshold is not None else 0.0,
+            self.iou_threshold
+        )
+        
+        if len(indices) == 0:
+            return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+            
+        if not isinstance(indices, list):
+            indices = indices.flatten()
+        
+        # 최종 결과 생성
+        bboxes = []
+        final_keypoints = []
+        final_kpt_scores = []
+        
+        for i in indices:
+            # 바운딩 박스 생성
+            idx = int(i)  # 인덱스 정수 확인
+            left, top, right, bottom = boxes_np[idx]
+            score = scores_np[idx]
+            bboxes.append(BBox(left, top, right, bottom, score, self.person_class_id))
+            
+            # 키포인트 변환
+            keypoints = valid_keypoints[idx]
+            keypoints_xy = keypoints[:, :2].copy()
+            
+            # 패딩 제거
+            keypoints_xy[:, 0] -= pad_w
+            keypoints_xy[:, 1] -= pad_h
+            
+            # 원본 이미지 크기로 스케일링
+            keypoints_xy[:, 0] *= scale_x
+            keypoints_xy[:, 1] *= scale_y
+            
+            # 키포인트 점수
+            keypoints_conf = keypoints[:, 2]
+            
+            final_keypoints.append(keypoints_xy)
+            final_kpt_scores.append(keypoints_conf)
+        
+        # 최종 결과를 상위 10개로 제한 (선택적)
+        if len(bboxes) > 10:
+            # 점수 기준으로 상위 10개만 선택
+            scores_array = np.array([bbox.score for bbox in bboxes])
+            top_indices = np.argsort(scores_array)[-10:]
+            
+            bboxes = [bboxes[i] for i in top_indices]
+            final_keypoints = [final_keypoints[i] for i in top_indices]
+            final_kpt_scores = [final_kpt_scores[i] for i in top_indices]
+        
+        return {
+            "bboxes": bboxes,
+            "keypoints": np.array(final_keypoints),
+            "scores": np.array(final_kpt_scores)
+        }
+
+    def process_batch(self, images: List[np.ndarray]) -> List[dict]:
+        """
+        배치 이미지 처리 (속도 향상)
+        
+        Args:
+            images: 이미지 리스트
+            
+        Returns:
+            List[dict]: 각 이미지에 대한 추론 결과 리스트
+        """
+        if not images:
+            return []
+        
+        batch_size = min(len(images), self.batch_size)
+        results = []
+        
+        # 배치 단위로 처리
+        for i in range(0, len(images), batch_size):
+            batch_images = images[i:i+batch_size]
+            
+            # 각 이미지 정보 저장
+            orig_shapes = []
+            processed_batch = []
+            padding_info = []
+            
+            # 배치 내 이미지 전처리
+            for img in batch_images:
+                original_H, original_W = img.shape[:2]
+                orig_shapes.append((original_H, original_W))
+                
+                processed_img, top, left = self.preprocess(img)
+                processed_batch.append(processed_img)
+                padding_info.append((top, left))
+            
+            # 배치 이미지 준비
+            if len(processed_batch) == 1:
+                # 단일 이미지인 경우
+                batch_input = processed_batch[0]
+            else:
+                # 여러 이미지 배치로 합치기
+                batch_input = np.concatenate(processed_batch, axis=0)
+            
+            # 배치 추론
+            batch_outputs = self.predict_batch(batch_input)
+            
+            # 결과 후처리
+            for j in range(len(batch_images)):
+                original_H, original_W = orig_shapes[j]
+                pad_h, pad_w = padding_info[j]
+                
+                # 배치 출력에서 해당 이미지 결과 가져오기
+                if len(processed_batch) == 1:
+                    output = batch_outputs
+                else:
+                    output = batch_outputs[j:j+1]
+                
+                # 후처리
+                resized_H, resized_W = processed_batch[0].shape[2], processed_batch[0].shape[3]
+                result = self.postprocess(
+                    output, original_H, original_W, resized_H, resized_W, pad_h, pad_w
+                )
+                results.append(result)
+        
+        return results
+
+    def predict_batch(self, batch_input: np.ndarray) -> np.ndarray:
+        """
+        배치 입력에 대한 모델 추론
+        
+        Args:
+            batch_input: 배치 처리된 이미지 입력 (B, 3, 640, 640)
+            
+        Returns:
+            np.ndarray: 출력 텐서
+        """
+        input_name = self.session.get_inputs()[0].name
+        input_data = {input_name: batch_input}
+        outputs = self.session.run(None, input_data)
+        return outputs[0]
 
