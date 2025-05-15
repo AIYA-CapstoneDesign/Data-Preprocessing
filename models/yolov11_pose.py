@@ -33,11 +33,9 @@ class YOLOv11Pose:
     def __call__(self, image: np.ndarray) -> dict:
         try:
             original_H, original_W = image.shape[:2]
-            print(f"원본 이미지 크기: {original_W}x{original_H}")
 
             image, top, left = self.preprocess(image)
             resized_H, resized_W = image.shape[2], image.shape[3]
-            print(f"전처리된 이미지 크기: {resized_W}x{resized_H}, 패딩: 상단={top}, 좌측={left}")
 
             outputs = self.predict(image)
 
@@ -160,9 +158,6 @@ class YOLOv11Pose:
             dict: {"bboxes": List[BBox], "keypoints": np.ndarray, "scores": np.ndarray}
         """
         try:
-            # 출력 형태 디버깅 정보
-            print(f"모델 출력 형태: {outputs.shape}")
-            
             # 배치 차원 제거 및 형상 조정
             # 출력이 (1, 56, 8400)이 아닐 경우 다른 방식으로 처리
             if len(outputs.shape) == 3 and outputs.shape[1] == 56:
@@ -205,7 +200,9 @@ class YOLOv11Pose:
             
             # 바운딩 박스를 XYWH(중심점, 너비, 높이)에서 XYXY(좌상단, 우하단)로 변환
             boxes = []
-            for box in filtered_boxes:
+            valid_indices = []  # 유효한 박스의 인덱스를 저장
+            
+            for i, box in enumerate(filtered_boxes):
                 x, y, w, h = box
                 
                 # 패딩 제거
@@ -223,15 +220,27 @@ class YOLOv11Pose:
                     continue
                     
                 boxes.append([left, top, right, bottom])
+                valid_indices.append(i)  # 유효한 박스의 인덱스 저장
             
             if not boxes:
                 return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
             
+            # 유효한 박스에 대응하는 점수만 선택
+            valid_scores = filtered_scores[valid_indices]
+            valid_keypoints = filtered_keypoints[valid_indices]
+            
             # NMS 적용
             boxes_np = np.array(boxes)
+            scores_np = np.array(valid_scores)
+            
+            # 크기 일치 확인
+            if len(boxes_np) != len(scores_np):
+                print(f"경고: 바운딩 박스({len(boxes_np)})와 점수({len(scores_np)})의 크기가 일치하지 않습니다.")
+                return {"bboxes": [], "keypoints": np.array([]), "scores": np.array([])}
+            
             indices = cv2.dnn.NMSBoxes(
                 boxes_np.tolist(),
-                filtered_scores,
+                scores_np.tolist(),
                 self.score_threshold if self.score_threshold is not None else 0.25,
                 self.iou_threshold if self.iou_threshold is not None else 0.45
             )
@@ -250,11 +259,11 @@ class YOLOv11Pose:
             for i in indices:
                 # 바운딩 박스 생성
                 left, top, right, bottom = boxes[i]
-                score = filtered_scores[i]
+                score = valid_scores[i]
                 bboxes.append(BBox(left, top, right, bottom, score, self.person_class_id))
                 
                 # 키포인트 변환
-                keypoints = filtered_keypoints[i]
+                keypoints = valid_keypoints[i]
                 keypoints_xy = keypoints[:, :2].copy()
                 
                 # 패딩 제거
