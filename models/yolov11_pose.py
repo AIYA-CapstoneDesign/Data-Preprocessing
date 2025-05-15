@@ -4,6 +4,7 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import onnxruntime
+from collections import deque
 
 from utils import BBox
 
@@ -21,6 +22,8 @@ class YOLOv11Pose:
         score_threshold: Optional[float] = 0.5,
         iou_threshold: Optional[float] = 0.5,
         batch_size: int = 1,
+        enable_smoothing: bool = False,
+        smooth_window_size: int = 5,
     ):
         self.onnx_path = onnx_path
         self.use_cuda = cuda
@@ -29,6 +32,11 @@ class YOLOv11Pose:
         self.iou_threshold = iou_threshold
         self.num_keypoints = 17  # COCO 키포인트 수
         self.batch_size = batch_size
+        
+        # 시간적 스무딩 관련 설정
+        self.enable_smoothing = enable_smoothing
+        self.smooth_window_size = smooth_window_size
+        self.keypoints_buffers = {}  # track_id를 키로 사용하는 딕셔너리
         
         self.load_model()
 
@@ -266,6 +274,12 @@ class YOLOv11Pose:
             # 키포인트 점수
             keypoints_conf = keypoints[:, 2]
             
+            # 시간적 스무딩 적용 (활성화된 경우)
+            if self.enable_smoothing and bboxes[-1].track_id is not None:
+                keypoints_xy = self.apply_temporal_smoothing(
+                    keypoints_xy, keypoints_conf, bboxes[-1].track_id
+                )
+                
             final_keypoints.append(keypoints_xy)
             final_kpt_scores.append(keypoints_conf)
         
@@ -364,4 +378,53 @@ class YOLOv11Pose:
         input_data = {input_name: batch_input}
         outputs = self.session.run(None, input_data)
         return outputs[0]
+
+    def clear_smoothing_buffers(self):
+        """
+        모든 스무딩 버퍼를 초기화
+        (새로운 시퀀스 처리 시 호출)
+        """
+        self.keypoints_buffers.clear()
+
+    def apply_temporal_smoothing(self, keypoints, scores, track_id):
+        """
+        키포인트에 시간적 스무딩 적용
+
+        Args:
+            keypoints: 현재 프레임의 키포인트 좌표 (17, 2)
+            scores: 키포인트 신뢰도 점수 (17,)
+            track_id: 추적 ID
+
+        Returns:
+            smoothed_keypoints: 스무딩된 키포인트 좌표
+        """
+        # 해당 ID의 버퍼가 없으면 새로 생성
+        if track_id not in self.keypoints_buffers:
+            self.keypoints_buffers[track_id] = deque(maxlen=self.smooth_window_size)
+
+        buffer = self.keypoints_buffers[track_id]
+        smoothed_keypoints = keypoints.copy()
+
+        if buffer:  # 버퍼에 이전 프레임 데이터가 있으면
+            for i in range(len(keypoints)):
+                if scores[i] < 0.3:  # 낮은 신뢰도는 필터링 안함
+                    continue
+
+                weight_sum = scores[i]
+                weighted_pos = keypoints[i] * scores[i]
+
+                # 이전 프레임 키포인트 가중 평균
+                for prev_keypoints, prev_scores in buffer:
+                    if prev_scores[i] > 0.2:
+                        weight = prev_scores[i]
+                        weighted_pos += prev_keypoints[i] * weight
+                        weight_sum += weight
+
+                if weight_sum > 0:
+                    smoothed_keypoints[i] = weighted_pos / weight_sum
+
+        # 현재 키포인트 버퍼에 저장
+        buffer.append((keypoints.copy(), scores.copy()))
+
+        return smoothed_keypoints
 

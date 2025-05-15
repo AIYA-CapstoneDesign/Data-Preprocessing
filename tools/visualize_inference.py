@@ -97,6 +97,8 @@ try:
             person_class_id=0,
             score_threshold=None,
             batch_size=args.batch_size,
+            enable_smoothing=args.smooth_keypoints,
+            smooth_window_size=args.smooth_window,
         )
 
     # Top-Down 모드에서만 검출기와 추적기 초기화

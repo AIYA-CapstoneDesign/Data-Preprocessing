@@ -570,6 +570,8 @@ def convert_to_keypoints(clips_path: str, output_path: str):
             score_threshold=args.det_score_thr,
             iou_threshold=0.45,
             batch_size=args.batch_size,
+            enable_smoothing=args.smooth_keypoints,
+            smooth_window_size=args.smooth_window,
         )
         detector = yolov11_pose  # 이후 코드에서 detector 변수를 사용하므로 통일
         person_class_id = 0
