@@ -1,0 +1,6 @@
+setuptools
+tqdm
+opencv-python
+numpy
+onnxruntime
+scipy
