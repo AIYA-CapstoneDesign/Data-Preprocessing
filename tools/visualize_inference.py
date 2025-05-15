@@ -6,9 +6,7 @@ from collections import deque
 import cv2
 import numpy as np
 
-from models.faster_rcnn import FasterRCNN
-from models.hrnet import HRNet
-from models.yolov8 import YOLOv8
+from models import YOLOv11Pose, FasterRCNN, HRNet, YOLOv8
 from trackers import ByteTrackTracker
 
 parser = argparse.ArgumentParser()
@@ -29,8 +27,8 @@ parser.add_argument(
     "--det-model",
     type=str,
     default="yolov8",
-    choices=["yolov8", "faster_rcnn"],
-    help="모델 선택 (yolov8 또는 faster_rcnn)",
+    choices=["yolov8", "faster_rcnn", "yolov11-pose"],
+    help="모델 선택 (yolov8, faster_rcnn 또는 yolov11-pose)",
 )
 parser.add_argument(
     "--det-score-thresh",
@@ -78,10 +76,21 @@ try:
         smooth_window_size=args.smooth_window,
     )
 
+    # YOLOv11-Pose 모델 초기화
+    yolov11_pose = None
+    if args.det_model == "yolov11-pose":
+        yolov11_pose = YOLOv11Pose(
+            onnx_path="models/onnx/yolo11m-pose.onnx",
+            cuda=True,
+            person_class_id=0,
+            score_threshold=args.det_score_thresh,
+            iou_threshold=0.45,
+        )
+
     # Top-Down 모드에서만 검출기와 추적기 초기화
     detector = None
     tracker = None
-    if args.pose_mode == "top-down":
+    if args.pose_mode == "top-down" and args.det_model != "yolov11-pose":
         # Faster R-CNN 초기화
 
         if args.det_model == "yolov8":
@@ -114,7 +123,7 @@ try:
             target_classes=[person_class_id],  # 사람 클래스만 추적 (모델에 따라 다름)
         )
 
-    print(f"모델 로딩 완료 ({args.pose_mode} 모드)")
+    print(f"모델 로딩 완료 ({args.pose_mode} 모드, {args.det_model} 모델)")
 except Exception as e:
     print(f"모델 로딩 오류: {e}")
     exit(1)
@@ -277,9 +286,13 @@ def visualize_inference(video_path: str, output_path: str = None):
         frame_start_time = time.time()
 
         try:
+            # YOLOv11-Pose 모델 사용
+            if args.det_model == "yolov11-pose" and yolov11_pose is not None:
+                # YOLOv11-Pose로 직접 추론
+                results = yolov11_pose(frame)
             # Top-Down 모드
-            if args.pose_mode == "top-down" and detector is not None:
-                # 객체 검출 (Faster R-CNN)
+            elif args.pose_mode == "top-down" and detector is not None:
+                # 객체 검출 (Faster R-CNN 또는 YOLOv8)
                 detections = detector(frame)
 
                 # 추적기가 있으면 추적 수행
