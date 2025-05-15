@@ -3,6 +3,7 @@ import glob
 import os
 import pickle
 import tempfile
+import traceback
 from collections import deque
 from typing import Dict, List, Tuple, Union
 
@@ -13,6 +14,7 @@ import tqdm
 from models.faster_rcnn import FasterRCNN
 from models.hrnet import HRNet
 from models.yolov8 import YOLOv8
+from models.yolov11_pose import YOLOv11Pose
 from trackers.bytetrack import ByteTrackTracker
 
 parser = argparse.ArgumentParser()
@@ -30,8 +32,8 @@ parser.add_argument(
     "--det-model",
     type=str,
     default="yolov8",
-    choices=["yolov8", "faster_rcnn"],
-    help="모델 선택 (yolov8 또는 faster_rcnn)",
+    choices=["yolov8", "faster_rcnn", "yolov11-pose"],
+    help="모델 선택 (yolov8, faster_rcnn, yolov11-pose)",
 )
 parser.add_argument(
     "--bbox-scale", type=float, default=1.25, help="포즈 추정용 바운딩 박스 스케일"
@@ -48,6 +50,35 @@ parser.add_argument(
     type=int,
     default=5,
     help="키포인트 스무딩 윈도우 크기 (프레임 수)",
+)
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=1,
+    help="배치 처리 크기 (1이면 비활성화, YOLOv11-Pose만 지원)",
+)
+parser.add_argument(
+    "--buffer-size",
+    type=int,
+    default=16,
+    help="프레임 버퍼 크기 (배치 처리 시 사용)",
+)
+parser.add_argument(
+    "--static-filter",
+    action="store_true",
+    help="정적인 물체 필터링 활성화 (인체 모형 등 움직임이 적은 물체 제거)",
+)
+parser.add_argument(
+    "--static-thresh",
+    type=float,
+    default=5.0,
+    help="정적 물체 필터링 임계값 (픽셀 단위, 이 값보다 작은 움직임을 가진 객체 제거)",
+)
+parser.add_argument(
+    "--static-frames",
+    type=int,
+    default=10,
+    help="움직임 분석에 사용할 최소 프레임 수 (이 값보다 적은 프레임에 등장한 객체는 분석하지 않음)",
 )
 args = parser.parse_args()
 
@@ -98,24 +129,30 @@ def extract_frames(
 
 def process_frames_with_pose_estimation(
     hrnet: HRNet,
-    detector: Union[YOLOv8, FasterRCNN],
+    detector: Union[YOLOv8, FasterRCNN, YOLOv11Pose],
     tracker: ByteTrackTracker,
     frames: List[np.ndarray] = None,
     visualize: bool = False,
     visualize_dir: str = None,
     min_track_ratio: float = 0.8,  # 최소 트랙 출현 비율 (기본 80%)
+    filter_static: bool = False,   # 정적 객체 필터링 활성화
+    static_thresh: float = 5.0,    # 정적 객체 필터링 임계값 (픽셀 단위)
+    static_min_frames: int = 10,   # 분석에 필요한 최소 프레임 수
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     포즈 추정 모델을 사용하여 모든 프레임을 처리
 
     Args:
         hrnet: HRNet 모델
-        detector: Faster R-CNN 모델
+        detector: 객체 검출 모델 또는 YOLOv11Pose 모델
         tracker: 추적기
         frames: 비디오 프레임 리스트
         visualize: 시각화 여부
         visualize_dir: 시각화 결과 저장 경로
         min_track_ratio: 저장할 트랙의 최소 출현 비율 (전체 프레임 중 해당 비율 이상 나타난 트랙만 저장)
+        filter_static: 정적 객체 필터링 활성화 여부
+        static_thresh: 정적 객체 필터링 임계값 (픽셀 단위)
+        static_min_frames: 분석에 필요한 최소 프레임 수
 
     Returns:
         keypoints: 포즈 키포인트 배열 (사람 수, 프레임, 17, 2)
@@ -126,37 +163,171 @@ def process_frames_with_pose_estimation(
 
     # 각 트랙 ID별 출현 프레임 수 카운트
     track_id_counts = {}
+    
+    # 움직임 분석을 위한 트랙 위치 저장
+    track_positions = {}  # track_id -> list of (center_x, center_y) 튜플
 
-    # tqdm으로 진행 상황 표시
-    pbar = tqdm.tqdm(frames, desc="프레임 처리")
+    # 배치 처리 여부 확인
+    use_batch = args.batch_size > 1 and isinstance(detector, YOLOv11Pose)
+    
+    if use_batch:
+        print(f"배치 처리 활성화: 배치 크기 = {args.batch_size}, 버퍼 크기 = {args.buffer_size}")
+        # 배치 처리를 위한 프레임 버퍼
+        frame_buffer = []
+        frame_indices = []
+        batch_size = min(args.batch_size, args.buffer_size)
+        
+        # tqdm으로 진행 상황 표시
+        pbar = tqdm.tqdm(range(len(frames)), desc="프레임 처리")
+        
+        # 프레임 배치 처리
+        for frame_idx in pbar:
+            # 버퍼에 프레임 추가
+            frame_buffer.append(frames[frame_idx])
+            frame_indices.append(frame_idx)
+            
+            # 버퍼가 가득 차거나 마지막 프레임이면 배치 처리
+            if len(frame_buffer) >= batch_size or frame_idx == len(frames) - 1:
+                try:
+                    # 배치 추론 수행
+                    batch_results = detector.process_batch(frame_buffer)
+                    
+                    # 배치 결과 처리
+                    for i, (frame_idx, frame, results) in enumerate(zip(frame_indices, frame_buffer, batch_results)):
+                        # 추적 수행 (YOLOv11-Pose에서는 바운딩 박스만 추출)
+                        detections = results["bboxes"]
+                        detections = tracker(detections)
+                        
+                        # 포즈 키포인트와 점수는 그대로 유지
+                        results["bboxes"] = detections
+                        
+                        # 트랙 ID별 출현 횟수 업데이트
+                        for bbox in results["bboxes"]:
+                            track_id = bbox.track_id if bbox.track_id is not None else -1
+                            if track_id not in track_id_counts:
+                                track_id_counts[track_id] = 0
+                            track_id_counts[track_id] += 1
+                            
+                            # 움직임 분석을 위한 위치 저장
+                            if filter_static and track_id != -1:
+                                # 바운딩 박스 중심점 계산
+                                center_x = (bbox.x1 + bbox.x2) / 2
+                                center_y = (bbox.y1 + bbox.y2) / 2
+                                
+                                if track_id not in track_positions:
+                                    track_positions[track_id] = []
+                                track_positions[track_id].append((center_x, center_y))
+                        
+                        # 결과 저장
+                        frame_results.append(results)
+                        
+                        # 시각화 (필요한 경우)
+                        if visualize and visualize_dir:
+                            visualize_frame(frames[frame_idx], results, frame_idx, visualize_dir)
+                    
+                    # 현재 진행 상황 업데이트 (추적 중인 객체 수 표시)
+                    pbar.set_postfix({"추적 객체 수": len(track_id_counts)})
+                    
+                except Exception as e:
+                    print(f"배치 처리 오류: {traceback.format_exc()}")
+                    # 오류가 발생하면 프레임별로 처리 (배치 처리 포기)
+                    for frame_idx, frame in zip(frame_indices, frame_buffer):
+                        # 개별 처리
+                        try:
+                            # 개별 추론
+                            result = detector(frame)
+                            detections = result["bboxes"]
+                            detections = tracker(detections)
+                            result["bboxes"] = detections
+                            
+                            # 트랙 ID별 출현 횟수 업데이트
+                            for bbox in result["bboxes"]:
+                                track_id = bbox.track_id if bbox.track_id is not None else -1
+                                if track_id not in track_id_counts:
+                                    track_id_counts[track_id] = 0
+                                track_id_counts[track_id] += 1
+                                
+                                # 움직임 분석을 위한 위치 저장
+                                if filter_static and track_id != -1:
+                                    # 바운딩 박스 중심점 계산
+                                    center_x = (bbox.x1 + bbox.x2) / 2
+                                    center_y = (bbox.y1 + bbox.y2) / 2
+                                    
+                                    if track_id not in track_positions:
+                                        track_positions[track_id] = []
+                                    track_positions[track_id].append((center_x, center_y))
+                            
+                            # 결과 저장
+                            frame_results.append(result)
+                            
+                            # 시각화 (필요한 경우)
+                            if visualize and visualize_dir:
+                                visualize_frame(frame, result, frame_idx, visualize_dir)
+                                
+                        except Exception as e:
+                            print(f"프레임 {frame_idx} 처리 오류: {e}")
+                            # 빈 결과 생성
+                            frame_results.append({"keypoints": [], "scores": [], "bboxes": []})
+                
+                # 버퍼 초기화
+                frame_buffer = []
+                frame_indices = []
+    else:
+        # 기존 코드: 프레임별 처리
+        # tqdm으로 진행 상황 표시
+        pbar = tqdm.tqdm(frames, desc="프레임 처리")
 
-    # 각 프레임 처리
-    for frame_idx, frame in enumerate(pbar):
-        # 검출 수행
-        detections = detector(frame)
+        # 각 프레임 처리
+        for frame_idx, frame in enumerate(pbar):
+            try:
+                # YOLOv11-Pose 직접 추론
+                if isinstance(detector, YOLOv11Pose):
+                    # YOLOv11-Pose로 직접 추론
+                    results = detector(frame)
+                    # 추적 처리
+                    detections = results["bboxes"]
+                    detections = tracker(detections)
+                    results["bboxes"] = detections
+                else:
+                    # 기존 방식: 검출 + HRNet
+                    # 검출 수행
+                    detections = detector(frame)
+                    # 추적 수행
+                    detections = tracker(detections)
+                    # 포즈 추정 (검출 결과를 이용)
+                    results = hrnet(frame, detections)
 
-        # 추적 수행
-        detections = tracker(detections)
+                # 트랙 ID별 출현 횟수 업데이트
+                for bbox in results["bboxes"]:
+                    track_id = bbox.track_id if bbox.track_id is not None else -1
+                    if track_id not in track_id_counts:
+                        track_id_counts[track_id] = 0
+                    track_id_counts[track_id] += 1
+                    
+                    # 움직임 분석을 위한 위치 저장
+                    if filter_static and track_id != -1:
+                        # 바운딩 박스 중심점 계산
+                        center_x = (bbox.x1 + bbox.x2) / 2
+                        center_y = (bbox.y1 + bbox.y2) / 2
+                        
+                        if track_id not in track_positions:
+                            track_positions[track_id] = []
+                        track_positions[track_id].append((center_x, center_y))
 
-        # 포즈 추정 (검출 결과를 이용)
-        results = hrnet(frame, detections)
+                # 현재 진행 상황 업데이트 (추적 중인 객체 수 표시)
+                pbar.set_postfix({"추적 객체 수": len(track_id_counts)})
 
-        # 트랙 ID별 출현 횟수 업데이트
-        for bbox in results["bboxes"]:
-            track_id = bbox.track_id if bbox.track_id is not None else -1
-            if track_id not in track_id_counts:
-                track_id_counts[track_id] = 0
-            track_id_counts[track_id] += 1
+                # 결과 저장
+                frame_results.append(results)
 
-        # 현재 진행 상황 업데이트 (추적 중인 객체 수 표시)
-        pbar.set_postfix({"추적 객체 수": len(track_id_counts)})
-
-        # 결과 저장
-        frame_results.append(results)
-
-        # 시각화 (필요한 경우)
-        if visualize and visualize_dir:
-            visualize_frame(frame, results, frame_idx, visualize_dir)
+                # 시각화 (필요한 경우)
+                if visualize and visualize_dir:
+                    visualize_frame(frame, results, frame_idx, visualize_dir)
+                    
+            except Exception as e:
+                print(f"프레임 {frame_idx} 처리 오류: {e}")
+                # 빈 결과 생성
+                frame_results.append({"keypoints": [], "scores": [], "bboxes": []})
 
     # 최소 출현 프레임 수 계산
     num_frames = len(frames)
@@ -168,9 +339,63 @@ def process_frames_with_pose_estimation(
         for track_id, count in track_id_counts.items()
         if count >= min_frames and track_id != -1  # -1은 유효한 트랙 ID가 아님
     ]
-
+    
+    # 정적 객체 필터링 (옵션이 활성화된 경우)
+    if filter_static:
+        static_track_ids = []
+        moving_track_ids = []
+        
+        for track_id in valid_track_ids:
+            positions = track_positions.get(track_id, [])
+            
+            # 충분한 프레임이 있는 경우에만 분석
+            if len(positions) >= static_min_frames:
+                # 움직임 분석: 위치 변화의 표준 편차 계산
+                x_positions = [pos[0] for pos in positions]
+                y_positions = [pos[1] for pos in positions]
+                
+                # 변화량 계산 방법 1: 표준 편차
+                x_std = np.std(x_positions)
+                y_std = np.std(y_positions)
+                position_std = np.sqrt(x_std**2 + y_std**2)
+                
+                # 변화량 계산 방법 2: 최대 이동 거리
+                max_distance = 0
+                for i in range(len(positions)):
+                    for j in range(i+1, len(positions)):
+                        dx = positions[i][0] - positions[j][0]
+                        dy = positions[i][1] - positions[j][1]
+                        distance = np.sqrt(dx**2 + dy**2)
+                        max_distance = max(max_distance, distance)
+                
+                # 디버깅 정보 출력
+                print(f"트랙 ID {track_id}: 표준편차={position_std:.2f}px, 최대거리={max_distance:.2f}px")
+                
+                # 임계값보다 작은 움직임을 가진 객체는 정적으로 간주
+                if position_std < static_thresh:
+                    static_track_ids.append(track_id)
+                else:
+                    moving_track_ids.append(track_id)
+            else:
+                # 프레임이 충분하지 않은 경우 일단 포함
+                moving_track_ids.append(track_id)
+        
+        # 필터링 결과 출력
+        if static_track_ids:
+            print(f"정적 객체 필터링: {len(static_track_ids)}개 객체 제외 (움직임 < {static_thresh}px)")
+            for track_id in static_track_ids:
+                positions = track_positions.get(track_id, [])
+                if positions:
+                    x_std = np.std([pos[0] for pos in positions])
+                    y_std = np.std([pos[1] for pos in positions])
+                    position_std = np.sqrt(x_std**2 + y_std**2)
+                    print(f"  - ID {track_id}: 움직임={position_std:.2f}px (프레임 수={len(positions)})")
+        
+        # 필터링된 결과로 유효한 트랙 ID 업데이트
+        valid_track_ids = moving_track_ids
+    
     print(
-        f"총 {len(track_id_counts)} 객체 중 {len(valid_track_ids)}개 객체가 {min_track_ratio*100:.0f}% 이상 출현 (프레임 수: {num_frames})"
+        f"총 {len(track_id_counts)} 객체 중 {len(valid_track_ids)}개 객체가 최종 선택됨 (출현 비율 {min_track_ratio*100:.0f}% 이상 & 충분한 움직임)"
     )
 
     # 추적 ID를 기준으로 결과 정렬
@@ -332,11 +557,25 @@ def convert_to_keypoints(clips_path: str, output_path: str):
         smooth_window_size=args.smooth_window,  # 스무딩 윈도우 크기
     )
 
-    # 반드시 Top-Down 모드 사용 (Faster R-CNN + 추적기)
-    # Faster R-CNN 초기화
-    if args.det_model == "yolov8":
+    # YOLOv11-Pose 모델 초기화
+    yolov11_pose = None
+    detector = None
+    
+    # 모델 선택에 따라 적절한 모델 로드
+    if args.det_model == "yolov11-pose":
+        yolov11_pose = YOLOv11Pose(
+            onnx_path="models/onnx/yolo11m-pose.onnx",
+            cuda=use_cuda,
+            person_class_id=0,
+            score_threshold=args.det_score_thr,
+            iou_threshold=0.45,
+            batch_size=args.batch_size,
+        )
+        detector = yolov11_pose  # 이후 코드에서 detector 변수를 사용하므로 통일
         person_class_id = 0
-
+    # Faster R-CNN 또는 YOLOv8 초기화
+    elif args.det_model == "yolov8":
+        person_class_id = 0
         detector = YOLOv8(
             onnx_path="models/onnx/yolov8x.onnx",
             cuda=use_cuda,
@@ -345,7 +584,6 @@ def convert_to_keypoints(clips_path: str, output_path: str):
         )
     else:
         person_class_id = 1
-
         detector = FasterRCNN(
             onnx_path="models/onnx/faster_rcnn.onnx",
             cuda=use_cuda,
@@ -428,6 +666,9 @@ def convert_to_keypoints(clips_path: str, output_path: str):
                         visualize=args.visualize,
                         visualize_dir=temp_visualize_dir,  # 임시 디렉토리 사용
                         min_track_ratio=0.8,  # 전체 프레임의 80% 이상 나타난 객체만 처리
+                        filter_static=args.static_filter,  # 정적 객체 필터링
+                        static_thresh=args.static_thresh,  # 정적 객체 필터링 임계값
+                        static_min_frames=args.static_frames,  # 분석에 필요한 최소 프레임 수
                     )
 
                     # 적어도 하나의 객체가 있는 경우에만 저장
