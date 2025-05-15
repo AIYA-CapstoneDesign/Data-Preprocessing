@@ -19,6 +19,14 @@ class DatasetAParser(BaseAnnotationParser):
             os.path.dirname(annotation_path).replace("label", "video"),
             os.path.splitext(os.path.basename(annotation_path))[0] + ".mp4",
         )
+        if not os.path.exists(video_path):
+            return []
+
+        split = None
+        if "Training" in video_path:
+            split = "train"
+        elif "Validation" in video_path:
+            split = "val"
 
         # 데이터셋 A의 경우 한 영상에 단일 행동 데이터
         clip_infos = []
@@ -29,6 +37,7 @@ class DatasetAParser(BaseAnnotationParser):
                     action_start=data["sensordata"]["fall_start_frame"],
                     action_end=data["sensordata"]["fall_end_frame"],
                     is_fall=is_fall,
+                    split=split,
                 )
             )
         else:
@@ -38,6 +47,7 @@ class DatasetAParser(BaseAnnotationParser):
                     action_start=0,
                     action_end=data["scene_info"]["scene_length"],
                     is_fall=is_fall,
+                    split=split,
                 )
             )
         return clip_infos

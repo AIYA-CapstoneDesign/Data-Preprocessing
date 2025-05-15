@@ -67,7 +67,7 @@ class BaseAnnotationParser(ABC):
 
     async def _run_parsing(self):
         """
-        비동기적으로 파싱 작업을 실행합니다.
+        비동기적으로 파싱 작업을 실행.
         """
         annotation_paths = self._filter_annotations(self.data_path)
         tasks = []
@@ -83,7 +83,7 @@ class BaseAnnotationParser(ABC):
 
     async def _save_clip_async(self, clip_info: ClipInfo, idx: int):
         """
-        비동기적으로 클립을 저장합니다. 실제 I/O 작업은 별도 스레드에서 실행됩니다.
+        비동기적으로 클립을 저장. 실제 I/O 작업은 별도 스레드에서 실행.
 
         Args:
             clip_info (ClipInfo): 클립 정보.
@@ -198,7 +198,7 @@ class BaseAnnotationParser(ABC):
 
             # 60FPS 영상의 경우 30FPS로 저장할 수 있도록 처리
             if is_60fps:
-                if frame_count % 2 == 0:  # 짝수 프레임만 저장 (2배 속도 향상)
+                if frame_count % 2 == 0:  # 짝수 프레임만 저장
                     writer.write(frame)
             else:
                 # 30FPS 영상은 모든 프레임 저장
