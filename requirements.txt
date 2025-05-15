@@ -2,5 +2,5 @@ setuptools
 tqdm
 opencv-python
 numpy
-onnxruntime
+onnxruntime-gpu
 scipy
