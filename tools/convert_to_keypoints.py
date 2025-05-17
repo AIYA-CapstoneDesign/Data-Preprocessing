@@ -549,7 +549,7 @@ def convert_to_keypoints(clips_path: str, output_path: str):
 
                         # 클립 정보와 키포인트 저장
                         kp_file = os.path.join(
-                            output_path, split, label, f"{clip_name}_keypoint.pkl"
+                            output_path, split, label, f"{clip_name}.pkl"
                         )
                         label_idx = 0 if label == "fall" else 1
 
