@@ -530,7 +530,7 @@ def convert_to_keypoints(clips_path: str, output_path: str):
                         static_min_frames=args.static_frames,
                     )
 
-                    clip_data_path = os.path.join(clips_path, f"{clip_name}.json")
+                    clip_data_path = os.path.join(clip_path, f"{clip_name}.json")
                     with open(clip_data_path, "r") as f:
                         clip_data = json.load(f)
 
