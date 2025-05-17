@@ -376,6 +376,9 @@ $RECYCLE.BIN/
 
 !assets/**/
 
+# Annotation files
+data/**/*.json
+
 # Pickle, ONNX, .etc
 *.pkl
 *.onnx
