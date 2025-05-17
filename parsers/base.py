@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 from tqdm import tqdm
+import subprocess
 
 
 @dataclass
@@ -33,7 +34,7 @@ class ClipInfo:
 
 
 class BaseAnnotationParser(ABC):
-    def __init__(self, dataset_name: str, data_path: str, max_workers: int = 4):
+    def __init__(self, dataset_name: str, data_path: str, max_workers: int = None):
         """
         파서 초기화 및 클립 출력 디렉토리 생성.
 
@@ -45,12 +46,14 @@ class BaseAnnotationParser(ABC):
         self.dataset_name = dataset_name
         self.data_path = os.path.join(data_path, self.dataset_name)
         self.output_path = f"./data/clips/"
-        self.max_workers = max_workers
 
         # 클립 출력 디렉토리 생성
         os.makedirs(self.output_path, exist_ok=True)
         os.makedirs(os.path.join(self.output_path, "fall"), exist_ok=True)
         os.makedirs(os.path.join(self.output_path, "nofall"), exist_ok=True)
+
+        # 스레드 풀 생성
+        self.executor = ThreadPoolExecutor(max_workers=max_workers or os.cpu_count())
 
     def parse(self):
         """
@@ -70,16 +73,18 @@ class BaseAnnotationParser(ABC):
         비동기적으로 파싱 작업을 실행.
         """
         annotation_paths = self._filter_annotations(self.data_path)
-        tasks = []
 
-        for annotation_path in annotation_paths:
-            clip_infos = self._parse_annotation(annotation_path)
-            for idx, clip_info in enumerate(clip_infos):
-                tasks.append(self._save_clip_async(clip_info, idx))
+        tasks: List[asyncio.Task] = []
+        for annotation_path in tqdm(annotation_paths, desc="주석 파일 파싱 중..."):
+            for idx, info in enumerate(self._parse_annotation(annotation_path)):
+                tasks.append(self._save_clip_async(info, idx))
 
-        # asyncio.gather를 사용하여 모든 태스크를 동시에 실행
-        for completed in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-            await completed
+        for f in tqdm(
+            asyncio.as_completed(tasks), total=len(tasks), desc="클립 저장 중..."
+        ):
+            await f
+
+        self.executor.shutdown(wait=True)
 
     async def _save_clip_async(self, clip_info: ClipInfo, idx: int):
         """
@@ -91,8 +96,9 @@ class BaseAnnotationParser(ABC):
         """
         # ThreadPoolExecutor를 사용하여 I/O 작업을 별도 스레드에서 실행
         loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            return await loop.run_in_executor(executor, self._save_clip, clip_info, idx)
+        return await loop.run_in_executor(
+            self.executor, self._save_clip, clip_info, idx
+        )
 
     @abstractmethod
     def _parse_annotation(self, annotation_path: str) -> List[ClipInfo]:
@@ -136,93 +142,84 @@ class BaseAnnotationParser(ABC):
         Returns:
             str: 저장된 비디오 경로
         """
+        # 비디오 파일 존재 확인
+        if not os.path.exists(clip_info.video_path):
+            print(f"비디오 파일이 존재하지 않습니다: {clip_info.video_path}")
+            return None
+
         cap = cv2.VideoCapture(clip_info.video_path)
         if not cap.isOpened():
-            raise IOError(f"비디오를 열 수 없음: {clip_info.video_path}")
+            print(f"비디오를 열 수 없음: {clip_info.video_path}")
+            return None
 
         # 영상 메타데이터 추출
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        is_60fps = fps > 59 and fps < 61
-        target_fps = 30 if is_60fps else fps  # 60fps인 경우 30fps로 변환
-
-        # FPS에 따른 클립 범위 계산
-        # TODO: 30FPS, 60FPS 외의 경우 추가 필요
-        if is_60fps:
-            half_clip_range = 100
-        else:
-            half_clip_range = 50
-
-        # 비디오 크기 계산을 위해 첫 프레임 읽기
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        ret, frame = cap.read()
-        if not ret:
-            raise RuntimeError(f"프레임 읽기 실패: {clip_info.video_path}")
-
-        # 비디오 크기 계산
-        height, width = frame.shape[:2]
-
-        # 클립 중심 프레임 계산
-        action_center = (clip_info.action_start + clip_info.action_end) // 2
-
-        # 추출할 클립의 시작 프레임과 끝 프레임 계산
-        start_frame = action_center - half_clip_range
-        end_frame = action_center + half_clip_range
-
-        # 예외상황 시 클립 범위 조정
-        if start_frame < 0:
-            start_frame = 0
-        elif end_frame > total_frames:
-            end_frame = total_frames
-
-        # 클립 저장 경로 생성
-        video_path = os.path.join(
-            self.output_path,
-            "fall" if clip_info.is_fall else "nofall",
-            f"{os.path.splitext(os.path.basename(clip_info.video_path))[0]}_{idx}.mp4",
-        )
-
-        # 클립 저장 객체 생성 및 코덱 설정
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(video_path, fourcc, target_fps, (width, height))
-
-        # 시작 프레임으로 이동
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-        # 클립 추출 - 순차적으로 읽어서 처리
-        frame_count = 0
-        while frame_count < (end_frame - start_frame):
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # 60FPS 영상의 경우 30FPS로 저장할 수 있도록 처리
-            if is_60fps:
-                if frame_count % 2 == 0:  # 짝수 프레임만 저장
-                    writer.write(frame)
-            else:
-                # 30FPS 영상은 모든 프레임 저장
-                writer.write(frame)
-
-            frame_count += 1
-
-        # 비디오 리소스 해제
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-        writer.release()
 
-        # 메타데이터 저장
-        if clip_info.split is not None and clip_info.action_position is not None:
-            json_path = os.path.join(
-                self.output_path,
-                "fall" if clip_info.is_fall else "nofall",
-                f"{os.path.splitext(os.path.basename(video_path))[0]}.json",
-            )
-            json_info = {
-                "split": clip_info.split,
-                "action_position": clip_info.action_position,
-            }
-            with open(json_path, "w") as f:
-                json.dump(json_info, f)
+        # 프레임 범위
+        center = (clip_info.action_start + clip_info.action_end) // 2
+        half_range = 100 if 59 < fps < 61 else 50
+        start_f = max(center - half_range, 0)
+        end_f = min(center + half_range, total_frames)
+        duration_sec = (end_f - start_f) / fps
+        start_sec = start_f / fps
 
-        tqdm.write(f"클립 {idx} 저장 완료: {video_path}")
-        return video_path
+        # 출력 경로
+        subdir = "fall" if clip_info.is_fall else "nofall"
+        basename = os.path.splitext(os.path.basename(clip_info.video_path))[0]
+        out_mp4 = os.path.join(self.output_path, subdir, f"{basename}_{idx}.mp4")
+
+        # FFmpeg 인코더 선택
+        # 우선 NVENC -> 실패하면 AMF -> 실패하면 CPU
+        enc_try = [
+            ("h264_nvenc", ["-qp", "28"]),
+            ("h264_amf", []),
+            ("libx264", ["-preset", "veryfast"]),
+        ]
+
+        # 리사이징 필터 설정
+        resize_filter = []
+        if width > 1920 or height > 1080:
+            resize_filter = [
+                "-vf",
+                "scale='if(gt(iw,1920),1920,iw)':'if(gt(ih,1080),1080,ih)':force_original_aspect_ratio=decrease",
+            ]
+
+        for codec, extra in enc_try:
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-ss", f"{start_sec:.3f}",
+                "-t", f"{duration_sec:.3f}",
+                "-i", clip_info.video_path,
+                "-r", "30" if 59 < fps < 61 else str(int(round(fps))),
+                *resize_filter,
+                "-c:v", codec,
+                *extra,
+                "-y",
+                out_mp4,
+            ]
+            ret = subprocess.call(cmd)
+            if ret == 0:
+                break  # success
+
+        if ret != 0:
+            print(f"[ERR] ffmpeg failed: {out_mp4}")
+            return None
+
+        # 메타데이터 JSON
+        if clip_info.split is not None or clip_info.action_position is not None:
+            json_out = os.path.join(self.output_path, subdir, f"{basename}_{idx}.json")
+            with open(json_out, "w", encoding="utf-8") as f:
+                payload = {}
+                if clip_info.split is not None:
+                    payload["split"] = clip_info.split
+                if clip_info.action_position is not None:
+                    payload["action_position"] = clip_info.action_position
+                json.dump(payload, f, ensure_ascii=False, indent=4)
+
+        return out_mp4
