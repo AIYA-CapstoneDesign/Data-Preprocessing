@@ -134,7 +134,7 @@ def process_frames_with_pose_estimation(
         num_batches = (len(frames) + batch_size - 1) // batch_size
         
         # 프로그레스바 설정
-        pbar = tqdm.tqdm(total=len(frames), desc="프레임", leave=False)
+        pbar = get_tqdm(total=len(frames), desc="프레임", leave=False)
         
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
@@ -217,7 +217,7 @@ def process_frames_with_pose_estimation(
         pbar.close()
     else:
         # 개별 프레임 처리
-        pbar = tqdm.tqdm(frames, desc="프레임", leave=False)
+        pbar = get_tqdm(frames, desc="프레임", leave=False)
 
         for frame_idx, frame in enumerate(pbar):
             try:
@@ -407,6 +407,11 @@ def visualize_frame(frame, results, frame_idx, visualize_dir):
     os.makedirs(visualize_dir, exist_ok=True)
     cv2.imwrite(os.path.join(visualize_dir, f"frame_{frame_idx:06d}.jpg"), vis_frame)
 
+def get_tqdm(*args, **kwargs):
+    kwargs.setdefault("leave", False)
+    if multiprocessing.current_process().name != "MainProcess":
+        kwargs["disable"] = True
+    return tqdm.tqdm(*args, **kwargs)
 
 def process_single_clip(args_dict):
     """
@@ -593,12 +598,17 @@ def process_single_clip(args_dict):
                 }
                 
     except Exception as e:
-        return {
-            "status": "error",
-            "clip_name": clip_name,
-            "label": label,
-            "error": str(e)
-        }
+        oom_phrases = (
+            "Failed to allocate memory",
+            "allocate memory for requested buffer",
+            "CUDA out of memory",
+            "std::bad_alloc",
+            "OrtMemoryError",
+        )
+        if any(p.lower() in str(e).lower() for p in oom_phrases):
+            raise MemoryError(str(e))
+        raise
+    
 
 
 def convert_to_keypoints(clips_path: str, output_path: str):
@@ -698,7 +708,7 @@ def convert_to_keypoints(clips_path: str, output_path: str):
         
         # 진행 상황 추적
         completed = 0
-        with tqdm.tqdm(total=len(all_clip_tasks), desc="클립 처리") as pbar:
+        with get_tqdm(total=len(all_clip_tasks), desc="클립 처리") as pbar:
             for future in as_completed(futures):
                 task = futures[future]
                 label = task["label"]
@@ -724,6 +734,10 @@ def convert_to_keypoints(clips_path: str, output_path: str):
                     
                 except Exception as e:
                     print(f"작업 실행 오류 ({clip_name}): {str(e)}")
+                except MemoryError as e:
+                    print(f"\n메모리 부족: {e}")
+                    executor.shutdown(cancel_futures=True)
+                    os._exit(1)
                 
                 # 진행 상황 업데이트
                 completed += 1
@@ -733,6 +747,7 @@ def convert_to_keypoints(clips_path: str, output_path: str):
                 if completed % args.log_interval == 0 or completed == len(all_clip_tasks):
                     progress = completed / len(all_clip_tasks) * 100
                     print(f"\n진행률: {progress:.1f}% ({completed}/{len(all_clip_tasks)})")
+                
     
     # 총 처리 시간 계산
     elapsed_time = time.time() - start_time

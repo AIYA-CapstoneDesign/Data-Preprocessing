@@ -58,12 +58,16 @@ class YOLOv11Pose:
         """
         ONNX 모델 로드
         """
+        sess_opts = onnxruntime.SessionOptions()
+        sess_opts.log_severity_level = 3
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
             if self.use_cuda
             else ["CPUExecutionProvider"]
         )
-        self.session = onnxruntime.InferenceSession(self.onnx_path, providers=providers)
+        self.session = onnxruntime.InferenceSession(
+            self.onnx_path, sess_options=sess_opts, providers=providers
+        )
 
     def letterbox(
         self, image: np.ndarray, new_shape: Tuple[int, int] = (640, 640)
