@@ -1,13 +1,16 @@
 import argparse
+import concurrent.futures
 import glob
+import json
+import multiprocessing
 import os
 import pickle
+import signal
+import sys
 import tempfile
-import json
-from typing import List, Tuple, Union
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -48,10 +51,32 @@ parser.add_argument(
 )
 parser.add_argument("--static-frames", type=int, default=10, help="최소 분석 프레임 수")
 parser.add_argument("--log-interval", type=int, default=100, help="로그 출력 간격")
-parser.add_argument("--num-workers", type=int, default=0, help="병렬 처리 worker 수 (0=자동)")
+parser.add_argument(
+    "--num-workers", type=int, default=0, help="병렬 처리 worker 수 (0=자동)"
+)
 parser.add_argument("--prefetch-frames", action="store_true", help="프레임 사전 로드")
 parser.add_argument("--skip-empty", action="store_true", help="빈 클립 건너뛰기")
+parser.add_argument(
+    "--skip-processed", action="store_true", help="이미 처리된 클립 건너뛰기"
+)
+parser.add_argument(
+    "--max-retry", type=int, default=3, help="작업 실패 시 최대 재시도 횟수"
+)
+parser.add_argument(
+    "--use-threads", action="store_true", help="프로세스 대신 스레드 사용 (안정성 향상)"
+)
 args = parser.parse_args()
+
+
+# 안전한 종료를 위한 시그널 핸들러
+def signal_handler(sig, frame):
+    print("\n프로그램 종료 신호를 받았습니다. 안전하게 종료합니다...")
+    sys.exit(0)
+
+
+# SIGINT, SIGTERM 시그널 핸들러 등록
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def extract_frames(
@@ -71,14 +96,14 @@ def extract_frames(
 
     # 비디오 메타데이터 가져오기
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     # 프레임 사전 메모리 할당 (선택 사항, 메모리 사용량 증가하지만 성능 향상)
     if prefetch and total_frames > 0:
         ret, test_frame = cap.read()
         if ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 비디오 시작으로 돌아가기
             frames = [None] * total_frames
-    
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -97,11 +122,11 @@ def extract_frames(
         frame_idx += 1
 
     cap.release()
-    
+
     # None 값 제거 (실제 프레임 수가 metadata와 다를 경우)
     if prefetch:
         frames = [f for f in frames if f is not None]
-        
+
     return frame_paths, frames
 
 
@@ -129,55 +154,59 @@ def process_frames_with_pose_estimation(
     if use_batch:
         # 배치 처리 최적화
         batch_size = min(args.batch_size, args.buffer_size)
-        
+
         # 배치 처리를 위한 프레임 준비
         num_batches = (len(frames) + batch_size - 1) // batch_size
-        
+
         # 프로그레스바 설정
         pbar = get_tqdm(total=len(frames), desc="프레임", leave=False)
-        
+
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(frames))
             frame_buffer = frames[start_idx:end_idx]
             frame_indices = list(range(start_idx, end_idx))
-            
+
             try:
                 # 배치 추론 수행
                 batch_results = detector.process_batch(frame_buffer)
-                
+
                 # 각 프레임 결과 처리
-                for i, (frame_idx, results) in enumerate(zip(frame_indices, batch_results)):
+                for i, (frame_idx, results) in enumerate(
+                    zip(frame_indices, batch_results)
+                ):
                     # 추적 처리
                     detections = results["bboxes"]
                     detections = tracker(detections)
                     results["bboxes"] = detections
-                    
+
                     # 트랙 ID 카운트 및 위치 저장
                     for bbox in results["bboxes"]:
                         track_id = bbox.track_id if bbox.track_id is not None else -1
                         if track_id not in track_id_counts:
                             track_id_counts[track_id] = 0
                         track_id_counts[track_id] += 1
-                        
+
                         # 움직임 분석용 위치 저장
                         if filter_static and track_id != -1:
                             center_x = (bbox.x1 + bbox.x2) / 2
                             center_y = (bbox.y1 + bbox.y2) / 2
-                            
+
                             if track_id not in track_positions:
                                 track_positions[track_id] = []
                             track_positions[track_id].append((center_x, center_y))
-                    
+
                     frame_results.append(results)
-                    
+
                     # 시각화 (필요한 경우)
                     if visualize and visualize_dir:
-                        visualize_frame(frames[frame_idx], results, frame_idx, visualize_dir)
-                
+                        visualize_frame(
+                            frames[frame_idx], results, frame_idx, visualize_dir
+                        )
+
                 # 프로그레스바 업데이트
                 pbar.update(len(frame_buffer))
-                
+
             except Exception as e:
                 # 배치 실패 시 개별 처리로 폴백
                 print(f"배치 처리 실패, 개별 처리로 전환: {str(e)}")
@@ -187,32 +216,36 @@ def process_frames_with_pose_estimation(
                         detections = result["bboxes"]
                         detections = tracker(detections)
                         result["bboxes"] = detections
-                        
+
                         for bbox in result["bboxes"]:
-                            track_id = bbox.track_id if bbox.track_id is not None else -1
+                            track_id = (
+                                bbox.track_id if bbox.track_id is not None else -1
+                            )
                             if track_id not in track_id_counts:
                                 track_id_counts[track_id] = 0
                             track_id_counts[track_id] += 1
-                            
+
                             if filter_static and track_id != -1:
                                 center_x = (bbox.x1 + bbox.x2) / 2
                                 center_y = (bbox.y1 + bbox.y2) / 2
-                                
+
                                 if track_id not in track_positions:
                                     track_positions[track_id] = []
                                 track_positions[track_id].append((center_x, center_y))
-                        
+
                         frame_results.append(result)
-                        
+
                         if visualize and visualize_dir:
                             visualize_frame(frame, result, frame_idx, visualize_dir)
-                    
+
                     except Exception:
-                        frame_results.append({"keypoints": [], "scores": [], "bboxes": []})
-                    
+                        frame_results.append(
+                            {"keypoints": [], "scores": [], "bboxes": []}
+                        )
+
                     # 개별 처리 프로그레스바 업데이트
                     pbar.update(1)
-        
+
         # 프로그레스바 닫기
         pbar.close()
     else:
@@ -407,11 +440,13 @@ def visualize_frame(frame, results, frame_idx, visualize_dir):
     os.makedirs(visualize_dir, exist_ok=True)
     cv2.imwrite(os.path.join(visualize_dir, f"frame_{frame_idx:06d}.jpg"), vis_frame)
 
+
 def get_tqdm(*args, **kwargs):
     kwargs.setdefault("leave", False)
     if multiprocessing.current_process().name != "MainProcess":
         kwargs["disable"] = True
     return tqdm.tqdm(*args, **kwargs)
+
 
 def process_single_clip(args_dict):
     """
@@ -423,11 +458,31 @@ def process_single_clip(args_dict):
     output_path = args_dict["output_path"]
     visualize = args_dict["visualize"]
     model_config = args_dict["model_config"]
-    
+
     try:
+        # 출력 파일 경로 확인
+        split = "unknown"  # 기본값
+        clip_data_path = os.path.join(os.path.dirname(clip_path), f"{clip_name}.json")
+        if os.path.exists(clip_data_path):
+            with open(clip_data_path, "r") as f:
+                clip_data = json.load(f)
+                split = clip_data.get("split", "unknown")
+
+        # 결과 파일 경로
+        kp_file = os.path.join(output_path, split, label, f"{clip_name}.pkl")
+
+        # 이미 처리된 파일은 건너뛰기
+        if args.skip_processed and os.path.exists(kp_file):
+            return {
+                "status": "skipped",
+                "clip_name": clip_name,
+                "label": label,
+                "reason": "이미 처리됨",
+            }
+
         # 모델 초기화
         use_cuda = model_config["use_cuda"]
-        
+
         # HRNet 모델 초기화
         hrnet = HRNet(
             onnx_path=model_config["hrnet_path"],
@@ -437,7 +492,7 @@ def process_single_clip(args_dict):
             enable_smoothing=model_config["smooth_keypoints"],
             smooth_window_size=model_config["smooth_window"],
         )
-        
+
         # 검출기 초기화
         detector = None
         if model_config["det_model"] == "yolov11-pose":
@@ -468,7 +523,7 @@ def process_single_clip(args_dict):
                 person_class_id=person_class_id,
                 score_threshold=None,
             )
-        
+
         # 추적기 초기화
         tracker = ByteTrackTracker(
             high_thresh=0.6,
@@ -477,34 +532,34 @@ def process_single_clip(args_dict):
             match_iou_thresh=0.3,
             max_lost=30,
         )
-        
+
         # 비디오 프레임 추출
         with tempfile.TemporaryDirectory() as tmp_dir:
             frame_paths, frames = extract_frames(
                 clip_path, tmp_dir, prefetch=model_config["prefetch_frames"]
             )
-            
+
             if len(frames) == 0:
                 return {
                     "status": "empty",
                     "clip_name": clip_name,
                     "label": label,
-                    "error": "빈 프레임"
+                    "error": "빈 프레임",
                 }
-            
+
             # 추적기 및 스무딩 버퍼 초기화
             tracker.reset()
             if model_config["smooth_keypoints"]:
                 hrnet.clear_smoothing_buffers()
                 if isinstance(detector, YOLOv11Pose):
                     detector.clear_smoothing_buffers()
-            
+
             # 시각화 디렉토리
             temp_visualize_dir = None
             if visualize:
                 temp_visualize_dir = os.path.join(tmp_dir, "visualize")
                 os.makedirs(temp_visualize_dir, exist_ok=True)
-            
+
             # 포즈 추정 수행
             keypoints, keypoint_scores = process_frames_with_pose_estimation(
                 hrnet=hrnet,
@@ -518,28 +573,15 @@ def process_single_clip(args_dict):
                 static_thresh=model_config["static_thresh"],
                 static_min_frames=model_config["static_frames"],
             )
-            
-            # 클립 메타데이터 읽기
-            clip_data_path = os.path.join(os.path.dirname(clip_path), f"{clip_name}.json")
-            if os.path.exists(clip_data_path):
-                with open(clip_data_path, "r") as f:
-                    clip_data = json.load(f)
-                    split = clip_data.get("split")
-            else:
-                split = None
-                
-            if split is None:
-                split = "unknown"
-            
+
             # 결과 저장
             if keypoints.size > 0:
                 # 인원수 계산
                 persons_count = keypoints.shape[0]
-                
+
                 # 클립 정보와 키포인트 저장
-                kp_file = os.path.join(output_path, split, label, f"{clip_name}.pkl")
                 label_idx = 0 if label == "fall" else 1
-                
+
                 kp_data = {
                     "keypoint": keypoints,
                     "keypoint_score": keypoint_scores,
@@ -550,11 +592,11 @@ def process_single_clip(args_dict):
                     "label": label_idx,
                     "label_name": label,
                 }
-                
+
                 os.makedirs(os.path.dirname(kp_file), exist_ok=True)
                 with open(kp_file, "wb") as f:
                     pickle.dump(kp_data, f)
-                
+
                 # 시각화 비디오 생성
                 if (
                     visualize
@@ -567,7 +609,7 @@ def process_single_clip(args_dict):
                     frame_files = sorted(
                         glob.glob(os.path.join(temp_visualize_dir, "*.jpg"))
                     )
-                    
+
                     if frame_files:
                         first_frame = cv2.imread(frame_files[0])
                         h, w = first_frame.shape[:2]
@@ -576,27 +618,27 @@ def process_single_clip(args_dict):
                         video_writer = cv2.VideoWriter(
                             vis_video_path, fourcc, fps, (w, h)
                         )
-                        
+
                         for frame_file in frame_files:
                             frame = cv2.imread(frame_file)
                             video_writer.write(frame)
-                        
+
                         video_writer.release()
-                
+
                 return {
                     "status": "success",
                     "clip_name": clip_name,
                     "label": label,
-                    "persons": persons_count
+                    "persons": persons_count,
                 }
             else:
                 return {
                     "status": "empty_keypoints",
                     "clip_name": clip_name,
                     "label": label,
-                    "error": "인식된 사람 없음"
+                    "error": "인식된 사람 없음",
                 }
-                
+
     except Exception as e:
         oom_phrases = (
             "Failed to allocate memory",
@@ -608,21 +650,22 @@ def process_single_clip(args_dict):
         if any(p.lower() in str(e).lower() for p in oom_phrases):
             raise MemoryError(str(e))
         raise
-    
 
 
 def convert_to_keypoints(clips_path: str, output_path: str):
     """비디오 클립 처리 및 키포인트 추출"""
     start_time = time.time()
-    
+
     # CUDA 사용 여부
     use_cuda = args.device == "cuda"
-    
+
     # 모델 설정 (각 프로세스에 전달할 정보)
     model_config = {
         "use_cuda": use_cuda,
         "det_model": args.det_model,
-        "hrnet_path": "models/onnx/hrnet_48.onnx" if args.mode_48 else "models/onnx/hrnet_32.onnx",
+        "hrnet_path": (
+            "models/onnx/hrnet_48.onnx" if args.mode_48 else "models/onnx/hrnet_32.onnx"
+        ),
         "yolov11_path": "models/onnx/yolo11m-pose.onnx",
         "yolov8_path": "models/onnx/yolov8x.onnx",
         "faster_rcnn_path": "models/onnx/faster_rcnn.onnx",
@@ -635,7 +678,7 @@ def convert_to_keypoints(clips_path: str, output_path: str):
         "static_filter": args.static_filter,
         "static_thresh": args.static_thresh,
         "static_frames": args.static_frames,
-        "prefetch_frames": args.prefetch_frames
+        "prefetch_frames": args.prefetch_frames,
     }
 
     # 출력 디렉토리 생성
@@ -658,110 +701,223 @@ def convert_to_keypoints(clips_path: str, output_path: str):
     labels = ["fall", "nofall"]
 
     # 처리 통계
-    clip_stats = {"total": 0, "valid": 0}
-    class_stats = {label: {"total": 0, "valid": 0} for label in labels}
+    clip_stats = {"total": 0, "valid": 0, "skipped": 0}
+    class_stats = {label: {"total": 0, "valid": 0, "skipped": 0} for label in labels}
 
     # 인식 인원수 통계 (1인당 1클립 데이터셋 특성 반영)
     persons_stats = {0: 0, 1: 0, 2: 0, "3+": 0}
-    
+
     # 각 클래스별 클립 목록 수집
     all_clip_tasks = []
-    
+
     for label in labels:
         class_dir = os.path.join(clips_path, label)
         if not os.path.exists(class_dir):
             print(f"경고: {class_dir} 디렉토리가 존재하지 않습니다.")
             continue
-        
+
         # 클립 목록 수집
         clip_paths = glob.glob(os.path.join(class_dir, "*.mp4"))
         class_stats[label]["total"] = len(clip_paths)
         clip_stats["total"] += len(clip_paths)
-        
+
         print(f"\n[{label}] 총 {len(clip_paths)}개 클립 처리 준비 중")
-        
+
         # 각 클립을 작업 목록에 추가
         for clip_path in clip_paths:
             clip_name = os.path.splitext(os.path.basename(clip_path))[0]
+
+            # 이미 처리된 파일 확인
+            if args.skip_processed:
+                # 가능한 모든 분할 디렉토리에서 결과 파일 확인
+                splits = ["train", "val", "unknown"]
+                processed = False
+                for split in splits:
+                    result_path = os.path.join(
+                        output_path, split, label, f"{clip_name}.pkl"
+                    )
+                    if os.path.exists(result_path):
+                        processed = True
+                        class_stats[label]["skipped"] += 1
+                        clip_stats["skipped"] += 1
+                        break
+
+                if processed:
+                    continue
+
             task_args = {
                 "clip_path": clip_path,
                 "clip_name": clip_name,
                 "label": label,
                 "output_path": output_path,
                 "visualize": args.visualize,
-                "model_config": model_config
+                "model_config": model_config,
             }
             all_clip_tasks.append(task_args)
-    
+
+    # 건너뛴 파일 정보 출력
+    if args.skip_processed and clip_stats["skipped"] > 0:
+        print(f"\n이미 처리된 {clip_stats['skipped']}개 클립 건너뛰기")
+        for label in labels:
+            if class_stats[label]["skipped"] > 0:
+                print(f"  - {label}: {class_stats[label]['skipped']}개")
+
+    # 실제 처리할 클립 수 계산
+    remaining_clips = clip_stats["total"] - clip_stats["skipped"]
+    if remaining_clips == 0:
+        print("\n처리할 클립이 없습니다. 모든 클립이 이미 처리되었습니다.")
+        return
+
+    print(f"\n처리 예정 클립: {remaining_clips}개")
+
     # 워커 수 설정 (자동 또는 사용자 지정)
     if args.num_workers <= 0:
         num_workers = max(1, multiprocessing.cpu_count() - 1)
     else:
         num_workers = min(args.num_workers, multiprocessing.cpu_count())
-    
+
     print(f"\n병렬 처리 시작: {num_workers}개 워커 사용")
-    
+
+    # 스레드 또는 프로세스 풀 선택
+    executor_class = ThreadPoolExecutor if args.use_threads else ProcessPoolExecutor
+    print(f"{'스레드' if args.use_threads else '프로세스'} 기반 병렬 처리 사용")
+
+    # 재시도 카운터
+    retry_counts = {}
+
     # 멀티프로세싱으로 클립 처리
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # 모든 작업 제출
-        futures = {executor.submit(process_single_clip, task): task for task in all_clip_tasks}
-        
+    with executor_class(max_workers=num_workers) as executor:
+        # 작업 제출 (초기)
+        futures_to_tasks = {}
+        for task in all_clip_tasks:
+            future = executor.submit(process_single_clip, task)
+            futures_to_tasks[future] = task
+
         # 진행 상황 추적
         completed = 0
-        with get_tqdm(total=len(all_clip_tasks), desc="클립 처리") as pbar:
-            for future in as_completed(futures):
-                task = futures[future]
-                label = task["label"]
-                clip_name = task["clip_name"]
-                
-                try:
-                    result = future.result()
-                    status = result["status"]
-                    
-                    if status == "success":
-                        # 인원수 통계 업데이트
-                        persons_count = result["persons"]
-                        if persons_count <= 2:
-                            persons_stats[persons_count] += 1
+        total_to_process = len(all_clip_tasks)
+
+        with get_tqdm(total=total_to_process, desc="클립 처리") as pbar:
+            while futures_to_tasks:
+                # 완료된 작업 처리
+                done, _ = concurrent.futures.wait(
+                    futures_to_tasks.keys(),
+                    timeout=0.5,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                for future in done:
+                    task = futures_to_tasks.pop(future)
+                    label = task["label"]
+                    clip_name = task["clip_name"]
+
+                    try:
+                        result = future.result()
+                        status = result["status"]
+
+                        # 성공한 경우
+                        if status == "success":
+                            # 인원수 통계 업데이트
+                            persons_count = result["persons"]
+                            if persons_count <= 2:
+                                persons_stats[persons_count] += 1
+                            else:
+                                persons_stats["3+"] += 1
+
+                            # 통계 업데이트
+                            class_stats[label]["valid"] += 1
+                            clip_stats["valid"] += 1
+
+                        # 건너뛴 경우
+                        elif status == "skipped":
+                            class_stats[label]["skipped"] += 1
+                            clip_stats["skipped"] += 1
+
+                        # 오류인 경우
+                        elif status == "error" and not args.skip_empty:
+                            print(f"클립 처리 오류 ({clip_name}): {result['error']}")
+
+                        # 진행 상황 업데이트
+                        completed += 1
+                        pbar.update(1)
+
+                    except Exception as e:
+                        error_str = str(e)
+
+                        # 메모리 에러인 경우 프로그램 종료
+                        oom_phrases = (
+                            "Failed to allocate memory",
+                            "allocate memory for requested buffer",
+                            "CUDA out of memory",
+                            "std::bad_alloc",
+                            "OrtMemoryError",
+                        )
+                        if any(p.lower() in error_str.lower() for p in oom_phrases):
+                            print(f"\n메모리 부족: {error_str}")
+                            executor.shutdown(wait=False)
+                            return
+
+                        # 프로세스 종료 에러 확인 및 재시도
+                        process_error_phrases = (
+                            "process in the process pool was terminated abruptly",
+                            "terminated abruptly while the future was running",
+                            "semaphore timeout",
+                            "lost connection",
+                            "The process has forked",
+                        )
+
+                        is_process_error = any(
+                            p.lower() in error_str.lower()
+                            for p in process_error_phrases
+                        )
+
+                        # 재시도 로직
+                        task_key = f"{clip_name}_{label}"
+                        retry_counts[task_key] = retry_counts.get(task_key, 0) + 1
+
+                        if (
+                            is_process_error
+                            and retry_counts[task_key] <= args.max_retry
+                        ):
+                            print(
+                                f"\n작업 재시도 ({clip_name}, {retry_counts[task_key]}/{args.max_retry}): {error_str}"
+                            )
+                            # 작업 재제출
+                            future = executor.submit(process_single_clip, task)
+                            futures_to_tasks[future] = task
                         else:
-                            persons_stats["3+"] += 1
-                        
-                        # 통계 업데이트
-                        class_stats[label]["valid"] += 1
-                        clip_stats["valid"] += 1
-                    elif status == "error" and not args.skip_empty:
-                        print(f"클립 처리 오류 ({clip_name}): {result['error']}")
-                    
-                except Exception as e:
-                    print(f"작업 실행 오류 ({clip_name}): {str(e)}")
-                except MemoryError as e:
-                    print(f"\n메모리 부족: {e}")
-                    executor.shutdown(cancel_futures=True)
-                    os._exit(1)
-                
-                # 진행 상황 업데이트
-                completed += 1
-                pbar.update(1)
-                
+                            # 재시도 횟수 초과 또는 다른 오류
+                            print(f"\n작업 실행 오류 ({clip_name}): {error_str}")
+                            completed += 1
+                            pbar.update(1)
+
                 # 주기적 진행 상황 로깅
-                if completed % args.log_interval == 0 or completed == len(all_clip_tasks):
-                    progress = completed / len(all_clip_tasks) * 100
-                    print(f"\n진행률: {progress:.1f}% ({completed}/{len(all_clip_tasks)})")
-                
-    
+                if completed % args.log_interval == 0 and completed > 0:
+                    progress = completed / total_to_process * 100
+                    print(f"\n진행률: {progress:.1f}% ({completed}/{total_to_process})")
+                    print(
+                        f"성공: {clip_stats['valid']}개, 건너뜀: {clip_stats['skipped']}개"
+                    )
+
     # 총 처리 시간 계산
     elapsed_time = time.time() - start_time
     hours, remainder = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
     # 간략 통계 출력
     print("\n===== 처리 결과 요약 =====")
     print(f"총 처리 시간: {int(hours)}시간 {int(minutes)}분 {int(seconds)}초")
-    print(f"총 처리 클립: {clip_stats['total']}개")
+    print(f"총 클립: {clip_stats['total']}개")
+    print(
+        f"건너뛴 클립: {clip_stats['skipped']}개 ({clip_stats['skipped']/clip_stats['total']*100:.1f}%)"
+    )
+    print(f"처리한 클립: {completed}개")
     print(
         f"유효 클립 수: {clip_stats['valid']}개 ({clip_stats['valid']/clip_stats['total']*100:.1f}%)"
     )
-    print(f"처리 속도: {clip_stats['total']/elapsed_time:.2f} 클립/초")
+
+    if completed > 0:
+        print(f"처리 속도: {completed/elapsed_time:.2f} 클립/초")
 
     # 클래스별 통계
     for label in labels:
@@ -769,30 +925,36 @@ def convert_to_keypoints(clips_path: str, output_path: str):
         if stats["total"] > 0:
             valid_ratio = stats["valid"] / stats["total"] * 100
             print(
-                f"[{label}] 유효 클립: {stats['valid']}/{stats['total']} ({valid_ratio:.1f}%)"
+                f"[{label}] 유효 클립: {stats['valid']}/{stats['total']} ({valid_ratio:.1f}%), 건너뜀: {stats['skipped']}"
             )
 
     # 인원 수 통계 (1인당 1클립 데이터셋 특성 확인)
-    print("\n===== 인식된 인원 통계 =====")
-    print(
-        f"0명 클립: {persons_stats[0]}개 ({persons_stats[0]/clip_stats['total']*100:.1f}%)"
-    )
-    print(
-        f"1명 클립: {persons_stats[1]}개 ({persons_stats[1]/clip_stats['total']*100:.1f}%)"
-    )
-    print(
-        f"2명 클립: {persons_stats[2]}개 ({persons_stats[2]/clip_stats['total']*100:.1f}%)"
-    )
-    print(
-        f"3명 이상: {persons_stats['3+']}개 ({persons_stats['3+']/clip_stats['total']*100:.1f}%)"
-    )
+    if clip_stats["valid"] > 0:
+        print("\n===== 인식된 인원 통계 =====")
+        print(
+            f"0명 클립: {persons_stats[0]}개 ({persons_stats[0]/clip_stats['valid']*100:.1f}%)"
+        )
+        print(
+            f"1명 클립: {persons_stats[1]}개 ({persons_stats[1]/clip_stats['valid']*100:.1f}%)"
+        )
+        print(
+            f"2명 클립: {persons_stats[2]}개 ({persons_stats[2]/clip_stats['valid']*100:.1f}%)"
+        )
+        print(
+            f"3명 이상: {persons_stats['3+']}개 ({persons_stats['3+']/clip_stats['valid']*100:.1f}%)"
+        )
 
-    # 1인당 1클립 원칙 확인
-    expected_ratio = (
-        persons_stats[1] / clip_stats["valid"] * 100 if clip_stats["valid"] > 0 else 0
-    )
-    print(f"\n클립당 1명 비율: {expected_ratio:.1f}% (정상적으로 처리된 클립 중)")
+        # 1인당 1클립 원칙 확인
+        expected_ratio = persons_stats[1] / clip_stats["valid"] * 100
+        print(f"\n클립당 1명 비율: {expected_ratio:.1f}% (정상적으로 처리된 클립 중)")
 
 
 if __name__ == "__main__":
-    convert_to_keypoints(args.clips_path, args.output_path)
+    try:
+        convert_to_keypoints(args.clips_path, args.output_path)
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 프로그램이 중단되었습니다.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n프로그램 실행 중 오류가 발생했습니다: {str(e)}")
+        sys.exit(1)
